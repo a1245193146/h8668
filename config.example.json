@@ -11,16 +11,40 @@
       "schedule_time": "02:00"
     },
     {
-      "name": "mysql_app",
+      "name": "mysql_app1",
       "type": "mysql",
       "enabled": true,
       "ssh_host": "192.168.1.10",
-      "ssh_user": "root",
-      "ssh_key": "C:\\Users\\admin\\.ssh\\id_rsa",
-      "database": "appdb",
+      "ssh_user": "backup",
+      "ssh_password": "<ssh-password>",
+      "database": "app_production",
       "mysql_user": "backup_user",
-      "backup_dir": "D:\\backups\\mysql",
+      "backup_dir": "D:\\backups\\mysql_app1",
       "schedule_time": "02:30"
+    },
+    {
+      "name": "mysql_app2",
+      "type": "mysql",
+      "enabled": true,
+      "ssh_host": "192.168.1.11",
+      "ssh_user": "backup",
+      "ssh_password": "<ssh-password>",
+      "database": "app_logs",
+      "mysql_user": "backup_user",
+      "backup_dir": "D:\\backups\\mysql_app2",
+      "schedule_time": "02:45"
+    },
+    {
+      "name": "mysql_analytics",
+      "type": "mysql",
+      "enabled": false,
+      "ssh_host": "192.168.1.12",
+      "ssh_user": "backup",
+      "ssh_password": "<ssh-password>",
+      "database": "analytics",
+      "mysql_user": "backup_user",
+      "backup_dir": "D:\\backups\\mysql_analytics",
+      "schedule_time": "03:00"
     },
     {
       "name": "sqlite_app",
@@ -29,20 +53,47 @@
       "db_path": "C:\\app\\data\\app.db",
       "backup_dir": "D:\\backups\\sqlite",
       "schedule_time": "03:00"
-    },
-    {
-      "name": "files_docs",
-      "type": "file",
-      "enabled": true,
-      "source_dirs": ["C:\\docs", "C:\\data"],
-      "backup_dir": "D:\\backups\\files",
-      "schedule_time": "03:30"
     }
   ],
-  "backup_paths": ["D:\\backups\\sqlserver", "D:\\backups\\mysql", "D:\\backups\\sqlite", "D:\\backups\\files"],
-  "schedule": {
-    "timezone": "local",
-    "run_mode": "daily"
+  "remote_file_sources": [
+    {
+      "name": "linux_app_files",
+      "os": "linux",
+      "enabled": true,
+      "host": "192.168.1.20",
+      "port": 22,
+      "username": "backup",
+      "password": "<ssh-password>",
+      "source_dirs": ["/opt/app/uploads", "/var/app/data"],
+      "backup_dir": "D:\\backups\\linux_files",
+      "schedule_time": "04:00"
+    },
+    {
+      "name": "win_shared_docs",
+      "os": "windows",
+      "enabled": true,
+      "host": "192.168.1.30",
+      "winrm_port": 5985,
+      "ssh_port": 22,
+      "domain": "CORP",
+      "username": "admin",
+      "password": "<domain-password>",
+      "source_dirs": ["C:\\SharedDocs", "D:\\AppData"],
+      "backup_dir": "D:\\backups\\win_files",
+      "schedule_time": "04:30"
+    }
+  ],
+  "backup_target": {
+    "host": "192.168.1.100",
+    "os": "windows",
+    "winrm_port": 5985,
+    "ssh_port": 22,
+    "domain": "CORP",
+    "username": "admin",
+    "password": "<domain-password>",
+    "base_path": "E:\\Backups",
+    "min_size_tb": 2,
+    "min_free_gb": 100
   },
   "disks": {
     "min_size_tb": 2,
@@ -57,6 +108,30 @@
     "to": "admin@company.com",
     "username": "<smtp-username>",
     "password": "<smtp-password>"
+  },
+  "restore_test": {
+    "enabled": false,
+    "schedule_day": 1,
+    "schedule_time": "03:00",
+    "linux_machine": {
+      "host": "192.168.1.200",
+      "port": 22,
+      "username": "root",
+      "password": "<root-password>",
+      "mysql_user": "root",
+      "mysql_password": "<mysql-root-password>",
+      "test_db": "restore_test_db"
+    },
+    "windows_machine": {
+      "host": "192.168.1.201",
+      "winrm_port": 5985,
+      "ssh_port": 22,
+      "domain": "CORP",
+      "username": "admin",
+      "password": "<domain-password>",
+      "sqlserver_instance": "localhost",
+      "test_db": "restore_test_db"
+    }
   },
   "retention_days": 30,
   "log_path": "logs/backup.log",

@@ -170,6 +170,146 @@ def release_lock(pid_file: str = "backup.pid") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Remote disk management (V2)
+# ---------------------------------------------------------------------------
+
+def create_target_connector(config: dict):
+    """
+    Create a connector for the backup_target from config.
+    Returns WindowsConnector for Windows targets.
+    """
+    target = config.get("backup_target", {})
+    if not target:
+        return None
+    try:
+        import sys, os as _os
+        _src = _os.path.dirname(_os.path.abspath(__file__))
+        if _src not in sys.path:
+            sys.path.insert(0, _src)
+        from connector import create_connector
+        return create_connector(target)
+    except Exception as exc:
+        logger.error("create_target_connector failed: %s", exc)
+        return None
+
+
+def scan_remote_disks(connector, min_size_tb: float = 2.0) -> list[dict]:
+    """
+    Scan disks on a remote Windows machine via connector.
+    Returns list of dicts: {path, total_gb, free_gb, used_gb}
+    Only includes drives with total capacity >= min_size_tb TB.
+    """
+    min_bytes = _tb_to_bytes(min_size_tb)
+    result: list[dict] = []
+
+    # PowerShell to list all logical disks
+    ps = (
+        "Get-WmiObject Win32_LogicalDisk | "
+        "Select-Object DeviceID, Size, FreeSpace | "
+        "ForEach-Object { \"$($_.DeviceID) $($_.Size) $($_.FreeSpace)\" }"
+    )
+    try:
+        exit_code, out, err = connector.exec_command(ps)
+        if exit_code != 0 or not out.strip():
+            logger.warning("scan_remote_disks: command failed (exit %d): %s", exit_code, err[:100])
+            return []
+        for line in out.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                dev_id = parts[0]  # e.g. "C:"
+                total_bytes = int(parts[1]) if parts[1] and parts[1] != "0" else 0
+                free_bytes = int(parts[2]) if parts[2] and parts[2] != "0" else 0
+                if total_bytes < min_bytes:
+                    continue
+                result.append({
+                    "path": dev_id + "\\",
+                    "total_gb": _bytes_to_gb(total_bytes),
+                    "free_gb": _bytes_to_gb(free_bytes),
+                    "used_gb": _bytes_to_gb(total_bytes - free_bytes),
+                })
+            except (ValueError, IndexError):
+                continue
+    except Exception as exc:
+        logger.error("scan_remote_disks failed: %s", exc)
+    return result
+
+
+def get_remote_target_disk(
+    connector,
+    min_size_tb: float = 2.0,
+    min_free_gb: float = 100.0,
+) -> str | None:
+    """
+    Return the first remote disk path with enough free space, or None.
+    """
+    for disk in scan_remote_disks(connector, min_size_tb):
+        if disk["free_gb"] >= min_free_gb:
+            return disk["path"]
+    return None
+
+
+def push_file_to_remote(
+    local_path: str,
+    remote_path: str,
+    connector,
+) -> bool:
+    """
+    Push a local file to a remote path via connector.
+    After upload, compute MD5 on both sides and verify.
+    Returns True on success, False on failure.
+    """
+    import hashlib
+
+    # Compute local MD5 first
+    local_md5 = ""
+    try:
+        h = hashlib.md5()
+        with open(local_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        local_md5 = h.hexdigest()
+    except Exception as exc:
+        logger.error("push_file_to_remote: cannot read local file %s: %s", local_path, exc)
+        return False
+
+    # Ensure remote directory exists
+    remote_dir = "\\".join(remote_path.replace("/", "\\").rstrip("\\").split("\\")[:-1])
+    if remote_dir:
+        connector.exec_command(
+            f"if (-not (Test-Path '{remote_dir}')) {{ New-Item -ItemType Directory -Force -Path '{remote_dir}' }}"
+        )
+
+    # Upload
+    ok = connector.upload_file(local_path, remote_path)
+    if not ok:
+        logger.error("push_file_to_remote: upload failed for %s", local_path)
+        return False
+
+    # Verify remote MD5 via PowerShell
+    ps_md5 = f"(Get-FileHash '{remote_path}' -Algorithm MD5).Hash.ToLower()"
+    exit_code, remote_md5_out, err = connector.exec_command(ps_md5)
+    if exit_code != 0:
+        logger.warning("push_file_to_remote: cannot verify remote MD5 (continuing): %s", err[:80])
+        return True  # Upload succeeded even if MD5 check fails
+
+    remote_md5 = remote_md5_out.strip().lower()
+    if remote_md5 and remote_md5 != local_md5:
+        logger.error(
+            "push_file_to_remote: MD5 MISMATCH for %s (local=%s remote=%s)",
+            local_path, local_md5, remote_md5
+        )
+        return False
+
+    logger.info("push_file_to_remote: OK %s → remote (%s)", local_path, local_md5[:8])
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Status file I/O
 # ---------------------------------------------------------------------------
 

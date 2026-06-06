@@ -25,3 +25,21 @@ backup-system-release/
 ├── start.bat   # 启动备份
 └── start_dashboard.bat
 ```
+
+---
+
+## V2 增强配置
+
+### 多MySQL数据库
+在 `config.json` 的 `databases[]` 中添加多个 mysql 类型条目，每个都有独立的 `schedule_time`。
+
+### 远程文件备份
+在 `config.json` 中添加 `remote_file_sources[]`（详见 `config.example.json`）：
+- Linux 机器：提供 `host`、`username`、`password`
+- Windows 机器：提供 `domain`、`winrm_port`、`ssh_port`
+
+### 远程存储目标
+配置 `backup_target`（远程 Windows 备份机），程序自动推送备份并进行远程多盘轮询。
+
+### 月度恢复验证
+`start.bat --verify-restore` 立即执行恢复验证；配置 `restore_test.enabled: true` 后，每月 1 日自动验证备份可用性。

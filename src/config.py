@@ -10,9 +10,6 @@ from typing import Any
 _ALLOWED_DATABASE_TYPES = {"sqlserver", "mysql", "sqlite", "file"}
 _REQUIRED_TOP_LEVEL_KEYS = {
     "databases",
-    "backup_paths",
-    "schedule",
-    "disks",
     "email",
     "retention_days",
     "log_path",
@@ -49,6 +46,17 @@ def load_config(path: str) -> dict[str, Any]:
     for index, entry in enumerate(databases):
         _validate_database_entry(entry, index)
 
+    names = [e.get("name", "") for e in databases]
+    if len(names) != len(set(names)):
+        raise ValueError("databases[] entries must have unique 'name' values")
+
+    remote_file_sources = data.get("remote_file_sources")
+    if remote_file_sources is not None:
+        if not isinstance(remote_file_sources, list):
+            raise ValueError("remote_file_sources must be a list")
+        for index, entry in enumerate(remote_file_sources):
+            _validate_remote_file_source_entry(entry, index)
+
     return data
 
 
@@ -73,3 +81,22 @@ def _validate_database_entry(entry: Any, index: int) -> None:
         raise ValueError(f"databases[{index}].enabled must be a boolean")
     if not isinstance(entry["schedule_time"], str) or not entry["schedule_time"].strip():
         raise ValueError(f"databases[{index}].schedule_time must be a non-empty string")
+
+
+def _validate_remote_file_source_entry(entry: Any, index: int) -> None:
+    if not isinstance(entry, dict):
+        raise ValueError(f"remote_file_sources[{index}] must be an object")
+
+    required = {"name", "os", "host"}
+    missing = sorted(required - entry.keys())
+    if missing:
+        raise ValueError(
+            f"remote_file_sources[{index}] missing required keys: {', '.join(missing)}"
+        )
+
+    if not isinstance(entry["name"], str) or not entry["name"].strip():
+        raise ValueError(f"remote_file_sources[{index}].name must be a non-empty string")
+    if not isinstance(entry["os"], str) or not entry["os"].strip():
+        raise ValueError(f"remote_file_sources[{index}].os must be a non-empty string")
+    if not isinstance(entry["host"], str) or not entry["host"].strip():
+        raise ValueError(f"remote_file_sources[{index}].host must be a non-empty string")

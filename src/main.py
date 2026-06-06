@@ -19,6 +19,7 @@ import alerter as _alerter
 import config as _config_mod
 import executor as _executor
 import scheduler as _scheduler
+import restore_verifier as _restore_verifier
 import utils as _utils
 import validator as _validator
 
@@ -51,6 +52,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--job",
         metavar="NAME",
         help="Only process the named job (use with --once)",
+    )
+    p.add_argument(
+        "--verify-restore",
+        action="store_true",
+        help="Force run monthly restore verification now",
     )
     return p
 
@@ -181,6 +187,40 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
         result=result,
     )
 
+    # Push to remote storage if backup_target configured
+    if result.get("success") and result.get("file_path"):
+        backup_target = config.get("backup_target", {})
+        if backup_target:
+            _push_to_remote_target(result["file_path"], job_name, config)
+
+
+def _push_to_remote_target(local_file: str, job_name: str, config: dict) -> None:
+    """Push a local backup file to the configured remote backup_target."""
+    target = config.get("backup_target", {})
+    if not target:
+        return
+    try:
+        connector = _utils.create_target_connector(config)
+        if connector is None:
+            logger.warning("_push_to_remote_target: could not create connector for %s", job_name)
+            return
+        base_path = target.get("base_path", "E:\\Backups")
+        remote_dir = f"{base_path}\\{job_name}"
+        remote_path = f"{remote_dir}\\{os.path.basename(local_file)}"
+
+        # Ensure remote dir exists (Windows)
+        connector.exec_command(
+            f"if (-not (Test-Path '{remote_dir}')) {{ New-Item -ItemType Directory -Force '{remote_dir}' }}"
+        )
+        ok = _utils.push_file_to_remote(local_file, remote_path, connector)
+        if ok:
+            logger.info("_push_to_remote_target: %s → %s OK", local_file, remote_path)
+        else:
+            logger.error("_push_to_remote_target: push failed for %s", local_file)
+        connector.close()
+    except Exception as exc:
+        logger.error("_push_to_remote_target failed for %s: %s", job_name, exc)
+
 
 def _update_status(
     config: dict[str, Any],
@@ -255,6 +295,15 @@ def run_once(config: dict[str, Any], job_filter: str | None = None) -> None:
     status = _utils.read_status(status_path)
     jobs = _scheduler.get_today_schedule(config, status)
 
+    # Also dispatch remote_file_sources jobs
+    for src in config.get("remote_file_sources", []):
+        if not src.get("enabled", False):
+            continue
+        # Add backup_type using same logic as scheduler
+        history = next((j for j in status.get("jobs", []) if j.get("name") == src.get("name")), {})
+        backup_type = "full" if _scheduler.should_run_full_backup(src, history) else "incremental"
+        jobs.append({**src, "backup_type": backup_type, "history": history})
+
     if job_filter:
         jobs = [j for j in jobs if j.get("name") == job_filter]
         if not jobs:
@@ -265,6 +314,11 @@ def run_once(config: dict[str, Any], job_filter: str | None = None) -> None:
         _run_job(job, config)
 
     _check_monthly_drill(config)
+
+    # Monthly restore verification
+    if _restore_verifier.is_verification_day(config):
+        logger.info("Monthly verification day — running restore verification")
+        _restore_verifier.run_monthly_verification(config)
 
 
 def dry_run(config: dict[str, Any], job_filter: str | None = None) -> None:
@@ -293,6 +347,29 @@ def dry_run(config: dict[str, Any], job_filter: str | None = None) -> None:
             f"  {marker} job={job['name']!r:30s} type={job['type']:12s} "
             f"backup={job['backup_type']:15s} time={job.get('schedule_time', '??')}"
         )
+
+    # Also surface disabled jobs so operators can see all configured jobs at a glance.
+    enabled_names = {j["name"] for j in jobs}
+    disabled_jobs = [
+        db for db in config.get("databases", [])
+        if not db.get("enabled", False)
+        and db.get("name") not in enabled_names
+        and (not job_filter or db.get("name") == job_filter)
+    ]
+    for job in disabled_jobs:
+        marker = "[DISABLED ]"
+        print(
+            f"  {marker} job={job['name']!r:30s} type={job['type']:12s} "
+            f"backup={'(skipped)':15s} time={job.get('schedule_time', '??')}"
+        )
+
+    # Show remote file sources
+    for src in config.get("remote_file_sources", []):
+        enabled = src.get("enabled", False)
+        marker = "[ DRY RUN ]" if enabled else "[DISABLED ]"
+        print(f"  {marker} remote={src.get('name','?'):25s} os={src.get('os','?'):8s} "
+              f"time={src.get('schedule_time','??')}")
+
     print("=" * 60)
 
 
@@ -343,6 +420,16 @@ def main() -> int:
     try:
         if args.dry_run:
             dry_run(cfg, args.job)
+            return 0
+
+        if args.verify_restore:
+            logger.info("--verify-restore: running restore verification now")
+            results = _restore_verifier.run_monthly_verification(cfg)
+            for r in results:
+                status_str = "OK" if r["success"] else "FAILED"
+                print(f"  [{status_str}] {r['db_name']:12s} tables={r['tables_count']} "
+                      f"duration={r['duration_seconds']:.1f}s "
+                      f"error={r.get('error_msg','')[:60] if not r['success'] else ''}")
             return 0
 
         if args.once:

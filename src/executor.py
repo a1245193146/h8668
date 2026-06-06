@@ -22,6 +22,11 @@ try:  # Supports both `python -m src.executor` and `sys.path.insert(0, 'src')` Q
 except ImportError:  # pragma: no cover - exercised by the documented one-line QA commands.
     from utils import get_target_disk  # type: ignore[no-redef]
 
+try:
+    from .connector import SSHPasswordConnector
+except ImportError:  # pragma: no cover - exercised by the documented one-line QA commands.
+    from connector import SSHPasswordConnector  # type: ignore[no-redef]
+
 BackupResult = dict[str, bool | str | float | None]
 
 
@@ -191,7 +196,118 @@ def backup_mysql(
     target_disk: str,
     backup_type: str = "full",
 ) -> BackupResult:
-    """Run mysqldump on a remote host over Paramiko SSH and pull it via SFTP."""
+    """Run mysqldump on a remote host over SSH and pull it via SFTP.
+
+    Routes to the V2 password-based path (SSHPasswordConnector) when
+    ``ssh_password`` is present in job_config, or falls back to the V1
+    paramiko key-file path when ``ssh_key`` is present.
+    """
+    if "ssh_password" in job_config:
+        return _backup_mysql_password(job_config, target_disk, backup_type)
+    return _backup_mysql_keyauth(job_config, target_disk, backup_type)
+
+
+def _backup_mysql_password(
+    job_config: dict[str, Any],
+    target_disk: str,
+    backup_type: str = "full",
+) -> BackupResult:
+    """V2: password-based SSH via SSHPasswordConnector."""
+
+    started_at = time.time()
+    job_name = _safe_job_name(job_config)
+    local_path = _backup_path(target_disk, job_name, "mysql", backup_type, "sql.gz")
+    local_md5_path = local_path + ".md5"
+    remote_path = f"/tmp/{job_name}_{_date_stamp()}_{_suffix_for('mysql', backup_type)}.sql.gz"
+    remote_md5_path = remote_path + ".md5"
+
+    try:
+        ssh_host = str(job_config["ssh_host"])
+        ssh_user = str(job_config["ssh_user"])
+        ssh_password = str(job_config["ssh_password"])
+        database = str(job_config["database"])
+        mysql_user = str(job_config["mysql_user"])
+    except KeyError as err:
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg=f"missing mysql config field: {err}",
+        )
+
+    last_error = "mysql backup failed"
+    for attempt in range(1, 4):
+        connector = SSHPasswordConnector(
+            host=ssh_host,
+            username=ssh_user,
+            password=ssh_password,
+            port=int(job_config.get("ssh_port", 22)),
+            max_retries=3,
+            retry_delay=30,
+        )
+        try:
+            quoted_remote = shlex.quote(remote_path)
+            quoted_remote_md5 = shlex.quote(remote_md5_path)
+            cmd = (
+                "mysqldump --single-transaction --routines --triggers "
+                f"--set-gtid-purged=OFF -u {shlex.quote(mysql_user)} {shlex.quote(database)} "
+                f"| gzip > {quoted_remote} && md5sum {quoted_remote} > {quoted_remote_md5}"
+            )
+            exit_code, _stdout, stderr = connector.exec_command(cmd)
+            if exit_code != 0:
+                last_error = stderr.strip() or f"remote mysqldump failed with exit status {exit_code}"
+                raise RuntimeError(last_error)
+
+            if not connector.download_file(remote_path, local_path):
+                last_error = f"SFTP download failed for {remote_path}"
+                raise RuntimeError(last_error)
+            if not connector.download_file(remote_md5_path, local_md5_path):
+                last_error = f"SFTP download failed for {remote_md5_path}"
+                raise RuntimeError(last_error)
+
+            with open(local_md5_path, "r", encoding="utf-8") as fh:
+                remote_md5 = fh.read().strip().split()[0]
+            local_md5 = _compute_md5_stream(local_path)
+            if remote_md5 != local_md5:
+                last_error = f"mysql backup md5 mismatch: remote={remote_md5} local={local_md5}"
+                _cleanup_paths(local_path, local_md5_path)
+                raise RuntimeError(last_error)
+
+            _write_md5_sidecar(local_path, local_md5)
+            connector.exec_command(f"rm -f {quoted_remote} {quoted_remote_md5}")
+            return _result(
+                success=True,
+                job_name=job_name,
+                backup_type=backup_type,
+                started_at=started_at,
+                file_path=local_path,
+                md5=local_md5,
+            )
+        except Exception as err:  # noqa: BLE001 - executor must convert all failures into BackupResult.
+            last_error = str(err) or err.__class__.__name__
+        finally:
+            connector.close()
+
+        _cleanup_paths(local_path, local_md5_path)
+        if attempt < 3:
+            time.sleep(30)
+
+    return _result(
+        success=False,
+        job_name=job_name,
+        backup_type=backup_type,
+        started_at=started_at,
+        error_msg=last_error,
+    )
+
+
+def _backup_mysql_keyauth(
+    job_config: dict[str, Any],
+    target_disk: str,
+    backup_type: str = "full",
+) -> BackupResult:
+    """V1 (legacy): key-file-based SSH via paramiko directly."""
 
     started_at = time.time()
     job_name = _safe_job_name(job_config)
@@ -515,12 +631,296 @@ def backup_files(
         )
 
 
+# ─── Remote File Backup ───────────────────────────────────────────────────────
+
+
+def backup_remote_files(
+    job_config: dict[str, Any],
+    target_disk: str,
+    backup_type: str = "full",
+) -> BackupResult:
+    """
+    Backup files from a remote server (Linux or Windows) to target_disk.
+
+    job_config must have: name, os, host, username, password, source_dirs, backup_dir
+    For Windows: also winrm_port, ssh_port, domain
+    For Linux: also port (SSH port)
+    """
+    started_at = time.time()
+    job_name = _safe_job_name(job_config)
+    os_type = str(job_config.get("os", "linux")).lower()
+
+    try:
+        import sys
+
+        _src = os.path.dirname(os.path.abspath(__file__))
+        if _src not in sys.path:
+            sys.path.insert(0, _src)
+        from connector import create_connector
+
+        connector = create_connector(job_config)
+    except Exception as exc:
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg=f"Failed to create connector: {exc}",
+        )
+
+    try:
+        if os_type == "linux":
+            return _backup_remote_files_linux(job_config, connector, target_disk, backup_type, started_at)
+        return _backup_remote_files_windows(job_config, connector, target_disk, backup_type, started_at)
+    finally:
+        try:
+            connector.close()
+        except Exception:
+            pass
+
+
+def _last_backup_mtime(target_disk: str, job_name: str, extension: str) -> float:
+    """Return newest local backup mtime for this remote file job, or 0 if none exists."""
+    out_dir = _ensure_out_dir(target_disk)
+    newest = 0.0
+    prefix = f"{job_name}_"
+    suffix = f".{extension}"
+    try:
+        for name in os.listdir(out_dir):
+            if not name.startswith(prefix) or not name.endswith(suffix):
+                continue
+            path = os.path.join(out_dir, name)
+            if os.path.isfile(path):
+                newest = max(newest, os.path.getmtime(path))
+    except OSError:
+        return 0.0
+    return newest
+
+
+def _ps_single_quote(value: str) -> str:
+    """Quote a string as a PowerShell single-quoted literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _backup_remote_files_linux(
+    job_config: dict[str, Any],
+    connector: Any,
+    target_disk: str,
+    backup_type: str,
+    started_at: float,
+) -> BackupResult:
+    """Linux remote file backup via SSH+tar."""
+    job_name = _safe_job_name(job_config)
+    source_dirs = [str(path) for path in job_config.get("source_dirs", [])]
+    if not source_dirs:
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg="No source_dirs configured",
+        )
+
+    suffix = "full" if backup_type == "full" else "incr"
+    remote_tmp = f"/tmp/{job_name}_{_date_stamp()}_{suffix}.tar.gz"
+    local_path = _backup_path(target_disk, job_name, "file", backup_type, "tar.gz")
+    local_md5_path = local_path + ".md5"
+    remote_md5_path = remote_tmp + ".md5"
+    quoted_remote = shlex.quote(remote_tmp)
+    quoted_remote_md5 = shlex.quote(remote_md5_path)
+
+    if backup_type == "full":
+        dirs_str = " ".join(shlex.quote(path) for path in source_dirs)
+        tar_cmd = f"tar -czf {quoted_remote} -- {dirs_str} && md5sum {quoted_remote} > {quoted_remote_md5}"
+    else:
+        cutoff = _last_backup_mtime(target_disk, job_name, "tar.gz")
+        find_parts = [
+            f"find {shlex.quote(path)} -type f -newermt @{int(cutoff)} -print0 2>/dev/null" for path in source_dirs
+        ]
+        find_cmd = " ; ".join(find_parts)
+        tar_cmd = (
+            f"({find_cmd}) | tar --null -czf {quoted_remote} -T - "
+            f"&& md5sum {quoted_remote} > {quoted_remote_md5}"
+        )
+
+    exit_code, _out, err = connector.exec_command(tar_cmd)
+    if exit_code not in (0, None):
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg=f"Remote tar failed (exit {exit_code}): {err[:200]}",
+        )
+
+    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+    ok = connector.download_file(remote_tmp, local_path)
+    md5_ok = connector.download_file(remote_md5_path, local_md5_path)
+    if not ok or not md5_ok:
+        _cleanup_paths(local_path, local_md5_path)
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg="SFTP download failed",
+        )
+
+    try:
+        with open(local_md5_path, "r", encoding="utf-8") as fh:
+            remote_md5 = fh.read().strip().split()[0]
+        md5_hex = _compute_md5_stream(local_path)
+        if remote_md5.lower() != md5_hex.lower():
+            raise ValueError(f"MD5 mismatch: remote={remote_md5} local={md5_hex}")
+        _write_md5_sidecar(local_path, md5_hex)
+    except Exception as exc:
+        _cleanup_paths(local_path, local_md5_path)
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg=f"MD5 failed: {exc}",
+        )
+
+    connector.exec_command(f"rm -f {quoted_remote} {quoted_remote_md5}")
+
+    return _result(
+        success=True,
+        job_name=job_name,
+        backup_type=backup_type,
+        started_at=started_at,
+        file_path=local_path,
+        md5=md5_hex,
+    )
+
+
+def _backup_remote_files_windows(
+    job_config: dict[str, Any],
+    connector: Any,
+    target_disk: str,
+    backup_type: str,
+    started_at: float,
+) -> BackupResult:
+    """Windows remote file backup via WinRM/SSH + Compress-Archive."""
+    job_name = _safe_job_name(job_config)
+    source_dirs = [str(path) for path in job_config.get("source_dirs", [])]
+    if not source_dirs:
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg="No source_dirs configured",
+        )
+
+    suffix = "full" if backup_type == "full" else "incr"
+    remote_tmp = f"C:\\Temp\\{job_name}_{_date_stamp()}_{suffix}.zip"
+    local_path = _backup_path(target_disk, job_name, "file", backup_type, "zip")
+    local_md5_path = local_path + ".md5"
+    remote_md5_path = remote_tmp + ".md5"
+    quoted_remote = _ps_single_quote(remote_tmp)
+    quoted_remote_md5 = _ps_single_quote(remote_md5_path)
+    source_array = "@(" + ",".join(_ps_single_quote(path) for path in source_dirs) + ")"
+
+    exit_code, _out, err = connector.exec_command(
+        "if (-not (Test-Path 'C:\\Temp')) { New-Item -ItemType Directory -Path 'C:\\Temp' | Out-Null }"
+    )
+    if exit_code not in (0, None):
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg=f"Remote temp setup failed (exit {exit_code}): {err[:200]}",
+        )
+
+    if backup_type == "full":
+        ps_cmd = (
+            f"$sources = {source_array};"
+            "$paths = foreach ($source in $sources) { Join-Path $source '*' };"
+            f"Compress-Archive -Path $paths -DestinationPath {quoted_remote} -Force;"
+            f"(Get-FileHash -Algorithm MD5 -Path {quoted_remote}).Hash.ToLower() | Set-Content -Path {quoted_remote_md5}"
+        )
+    else:
+        cutoff = _last_backup_mtime(target_disk, job_name, "zip")
+        ps_cmd = (
+            f"$sources = {source_array};"
+            f"$cutoff = [DateTimeOffset]::FromUnixTimeSeconds({int(cutoff)}).LocalDateTime;"
+            "$files = foreach ($source in $sources) { "
+            "Get-ChildItem -Recurse -File -Path $source -ErrorAction SilentlyContinue "
+            "| Where-Object { $_.LastWriteTime -gt $cutoff } };"
+            "if ($files) { "
+            f"Compress-Archive -Path ($files.FullName) -DestinationPath {quoted_remote} -Force "
+            "} else { "
+            "Add-Type -AssemblyName System.IO.Compression.FileSystem;"
+            f"$zip = [System.IO.Compression.ZipFile]::Open({quoted_remote}, 'Create'); $zip.Dispose() "
+            "};"
+            f"(Get-FileHash -Algorithm MD5 -Path {quoted_remote}).Hash.ToLower() | Set-Content -Path {quoted_remote_md5}"
+        )
+
+    exit_code, _out, err = connector.exec_command(ps_cmd)
+    if exit_code not in (0, None):
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg=f"Remote compress failed (exit {exit_code}): {err[:200]}",
+        )
+
+    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+    ok = connector.download_file(remote_tmp, local_path)
+    md5_ok = connector.download_file(remote_md5_path, local_md5_path)
+    if not ok or not md5_ok or not os.path.exists(local_path):
+        _cleanup_paths(local_path, local_md5_path)
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg="File download failed",
+        )
+
+    try:
+        with open(local_md5_path, "r", encoding="utf-8") as fh:
+            remote_md5 = fh.read().strip().split()[0]
+        md5_hex = _compute_md5_stream(local_path)
+        if remote_md5.lower() != md5_hex.lower():
+            raise ValueError(f"MD5 mismatch: remote={remote_md5} local={md5_hex}")
+        _write_md5_sidecar(local_path, md5_hex)
+    except Exception as exc:
+        _cleanup_paths(local_path, local_md5_path)
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg=f"MD5 failed: {exc}",
+        )
+
+    connector.exec_command(
+        f"Remove-Item -Force {quoted_remote},{quoted_remote_md5} -ErrorAction SilentlyContinue"
+    )
+
+    return _result(
+        success=True,
+        job_name=job_name,
+        backup_type=backup_type,
+        started_at=started_at,
+        file_path=local_path,
+        md5=md5_hex,
+    )
+
+
 def dispatch_backup(
     job_config: dict[str, Any],
     target_disk: str,
     backup_type: str = "full",
 ) -> BackupResult:
     t = job_config.get("type")
+    if t == "file" and "os" in job_config:
+        return backup_remote_files(job_config, target_disk, backup_type)
     if t == "sqlserver":
         return backup_sqlserver(job_config, target_disk, backup_type)
     if t == "mysql":
