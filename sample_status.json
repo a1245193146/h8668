@@ -1,0 +1,63 @@
+{
+  "last_updated": "2026-06-06T02:35:00Z",
+  "disks": [
+    {"path": "D:\\", "total_gb": 4096.0, "free_gb": 2150.0, "used_gb": 1946.0},
+    {"path": "E:\\", "total_gb": 8192.0, "free_gb": 6800.0, "used_gb": 1392.0}
+  ],
+  "jobs": [
+    {
+      "name": "sqlserver_main",
+      "type": "sqlserver",
+      "last_full": "2026-06-01T02:00:00Z",
+      "last_incremental": "2026-06-05T02:00:00Z",
+      "chain_status": "intact",
+      "last_result": "success",
+      "file_path": "D:\\backups\\sqlserver\\sqlserver_main_20260605_diff.bak",
+      "file_size_mb": 1234.5,
+      "md5_verified": true,
+      "duration_seconds": 145
+    },
+    {
+      "name": "mysql_app",
+      "type": "mysql",
+      "last_full": "2026-06-01T02:30:00Z",
+      "last_incremental": "2026-06-05T02:30:00Z",
+      "chain_status": "intact",
+      "last_result": "success",
+      "file_path": "D:\\backups\\mysql\\mysql_app_20260605_incr.sql.gz",
+      "file_size_mb": 87.3,
+      "md5_verified": true,
+      "duration_seconds": 42
+    },
+    {
+      "name": "sqlite_app",
+      "type": "sqlite",
+      "last_full": "2026-06-01T03:00:00Z",
+      "last_incremental": "2026-06-05T03:00:00Z",
+      "chain_status": "intact",
+      "last_result": "success",
+      "file_path": "D:\\backups\\sqlite\\sqlite_app_20260605_incr.db.gz",
+      "file_size_mb": 12.1,
+      "md5_verified": true,
+      "duration_seconds": 8
+    },
+    {
+      "name": "files_docs",
+      "type": "file",
+      "last_full": "2026-06-01T03:30:00Z",
+      "last_incremental": "2026-06-04T03:30:00Z",
+      "chain_status": "broken",
+      "last_result": "failed",
+      "file_path": null,
+      "file_size_mb": 0,
+      "md5_verified": false,
+      "duration_seconds": 0
+    }
+  ],
+  "alerts": [
+    {"time": "2026-06-05T03:31:00Z", "level": "error", "message": "[files_docs] Backup failed: source path C:\\docs not accessible"},
+    {"time": "2026-06-05T03:31:05Z", "level": "error", "message": "[files_docs] Chain broken: missing 20260605 incremental"},
+    {"time": "2026-06-04T02:00:12Z", "level": "info", "message": "[sqlserver_main] Full backup completed successfully (1234.5 MB)"},
+    {"time": "2026-06-04T02:30:05Z", "level": "info", "message": "[mysql_app] Differential backup completed (87.3 MB)"}
+  ]
+}

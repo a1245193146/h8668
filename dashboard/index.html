@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>备份系统监控 | Backup Monitor</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="app-header">
+    <h1>备份系统监控</h1>
+    <button class="theme-toggle" id="theme-btn" onclick="toggleTheme()">🌙</button>
+  </header>
+  <main class="dashboard-grid">
+    <!-- Section: Disk Usage -->
+    <section class="card" id="disk-section">
+      <h2>磁盘使用率</h2>
+      <canvas id="disk-chart"></canvas>
+    </section>
+    <!-- Section: Backup Timeline -->
+    <section class="card" id="timeline-section">
+      <h2>备份时间线</h2>
+      <canvas id="timeline-chart"></canvas>
+    </section>
+    <!-- Section: Chain Status -->
+    <section class="card" id="chain-section">
+      <h2>备份链状态</h2>
+      <div id="chain-status-list"></div>
+    </section>
+    <!-- Section: Alerts -->
+    <section class="card" id="alert-section">
+      <h2>最近告警</h2>
+      <ul id="alert-list" class="alert-list"></ul>
+    </section>
+  </main>
+  <footer class="app-footer">
+    <span id="last-updated">--</span>
+    <span>自动刷新: 60秒</span>
+  </footer>
+  <script src="lib/chart.min.js"></script>
+  <script src="app.js"></script>
+  <script>init();</script>
+</body>
+</html>

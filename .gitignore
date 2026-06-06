@@ -1,0 +1,12 @@
+﻿.venv/
+__pycache__/
+*.pyc
+*.pyo
+logs/
+backup_status.json
+backup.pid
+*.log
+.omo/evidence/
+.omo/notepads/
+.omo/run-continuation/
+.omo/boulder.json

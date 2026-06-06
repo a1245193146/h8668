@@ -1,0 +1,65 @@
+{
+  "databases": [
+    {
+      "name": "sqlserver_main",
+      "type": "sqlserver",
+      "enabled": true,
+      "server": "localhost",
+      "database": "MyDB",
+      "auth": { "user": "sa", "password": "<your-password>" },
+      "backup_dir": "D:\\backups\\sqlserver",
+      "schedule_time": "02:00"
+    },
+    {
+      "name": "mysql_app",
+      "type": "mysql",
+      "enabled": true,
+      "ssh_host": "192.168.1.10",
+      "ssh_user": "root",
+      "ssh_key": "C:\\Users\\admin\\.ssh\\id_rsa",
+      "database": "appdb",
+      "mysql_user": "backup_user",
+      "backup_dir": "D:\\backups\\mysql",
+      "schedule_time": "02:30"
+    },
+    {
+      "name": "sqlite_app",
+      "type": "sqlite",
+      "enabled": true,
+      "db_path": "C:\\app\\data\\app.db",
+      "backup_dir": "D:\\backups\\sqlite",
+      "schedule_time": "03:00"
+    },
+    {
+      "name": "files_docs",
+      "type": "file",
+      "enabled": true,
+      "source_dirs": ["C:\\docs", "C:\\data"],
+      "backup_dir": "D:\\backups\\files",
+      "schedule_time": "03:30"
+    }
+  ],
+  "backup_paths": ["D:\\backups\\sqlserver", "D:\\backups\\mysql", "D:\\backups\\sqlite", "D:\\backups\\files"],
+  "schedule": {
+    "timezone": "local",
+    "run_mode": "daily"
+  },
+  "disks": {
+    "min_size_tb": 2,
+    "min_free_gb": 100
+  },
+  "email": {
+    "enabled": false,
+    "smtp_host": "smtp.company.com",
+    "smtp_port": 587,
+    "smtp_tls": true,
+    "from": "backup@company.com",
+    "to": "admin@company.com",
+    "username": "<smtp-username>",
+    "password": "<smtp-password>"
+  },
+  "retention_days": 30,
+  "log_path": "logs/backup.log",
+  "status_file": "backup_status.json",
+  "pid_file": "backup.pid"
+}

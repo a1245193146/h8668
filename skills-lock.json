@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "skills": {
+    "database-backups": {
+      "source": "bagelhole/devops-security-agent-skills",
+      "sourceType": "github",
+      "skillPath": "infrastructure/databases/database-backups/SKILL.md",
+      "computedHash": "98bbc6f88581ae211894fd287a10cd3575ae3b2e8a0420cf760a3edbe42dc474"
+    },
+    "frontend-design": {
+      "source": "anthropics/skills",
+      "sourceType": "github",
+      "skillPath": "skills/frontend-design/SKILL.md",
+      "computedHash": "516bd2154eb843a8240e43d5b285229129853114ad7075a5e141e1c08e408c84"
+    },
+    "linux-server-expert": {
+      "source": "duck4nh/antigravity-kit",
+      "sourceType": "github",
+      "skillPath": "templates/.agent/skills/linux-server-expert/SKILL.md",
+      "computedHash": "6c83a01213e752ebf7582d90b565f294c0bf3d701a29f2dcf8f0e39d5f39dcd8"
+    },
+    "monitoring-and-alerting": {
+      "source": "rampstackco/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/monitoring-and-alerting/SKILL.md",
+      "computedHash": "21187c5ce12c4f58df50a8868e6ec1fb03f9a6d4a09db65e01f26ce0ab4e6134"
+    },
+    "mssql": {
+      "source": "billpeet/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/mssql/SKILL.md",
+      "computedHash": "551424de99a43407de720501b31f56d8cfb85ac7f2c0c80cffe1828bec534d5d"
+    },
+    "mysql": {
+      "source": "bagelhole/devops-security-agent-skills",
+      "sourceType": "github",
+      "skillPath": "infrastructure/databases/mysql/SKILL.md",
+      "computedHash": "44e135c26eee3d02ca3df9af7a498c8c7f9c3f40cc79ea587fd1939775113096"
+    },
+    "python-best-practices": {
+      "source": "0xbigboss/claude-code",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/python-best-practices/SKILL.md",
+      "computedHash": "9096f9ba1660f3dc864206f05f2851f77a3872dded644514a63a509d5052466d"
+    },
+    "ssh-remote": {
+      "source": "oakoss/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/ssh-remote/SKILL.md",
+      "computedHash": "579213429c54a394e36deb407869d4d189d76bfad0023b4bdefdaabf5d3580e0"
+    }
+  }
+}
