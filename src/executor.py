@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -122,7 +123,9 @@ def backup_sqlserver(
     out_path = _backup_path(target_disk, job_name, "sqlserver", backup_type, "bak")
 
     try:
-        server = str(job_config["server"])
+        # U8/read-write separation: run BACKUP against the read replica when
+        # configured to keep load-balanced primary workloads isolated.
+        server = str(job_config.get("read_replica") or job_config["server"])
         db = str(job_config["database"])
         auth = job_config.get("auth") or {}
         user = str(auth["user"])
@@ -207,6 +210,62 @@ def backup_mysql(
     return _backup_mysql_keyauth(job_config, target_disk, backup_type)
 
 
+def _build_mysql_dump_command(
+    job_config: dict[str, Any],
+    remote_out: str,
+    remote_md5: str,
+) -> str:
+    """Build the remote mysqldump shell command.
+
+    Supports separate MySQL credentials decoupled from SSH login, configurable
+    native or Docker-wrapped mysql/mysqldump paths, explicit database lists,
+    all-database dumps with exclude filters, and the legacy single ``database``
+    field.
+    """
+
+    mysqldump = str(job_config.get("mysqldump_path", "mysqldump"))
+    mysql_bin = str(job_config.get("mysql_path", "mysql"))
+    mysql_host = str(job_config.get("mysql_host", "127.0.0.1"))
+    mysql_port = int(job_config.get("mysql_port", 3306))
+    mysql_user = str(job_config["mysql_user"])
+    mysql_password = str(job_config.get("mysql_password", ""))
+
+    host_arg = f"-h{shlex.quote(mysql_host)}"
+    port_arg = f"-P{mysql_port}"
+    user_arg = f"-u{shlex.quote(mysql_user)}"
+    pw_arg = ("-p" + shlex.quote(mysql_password)) if mysql_password else ""
+    conn = " ".join(p for p in (host_arg, port_arg, user_arg, pw_arg) if p)
+
+    dump_opts = "--single-transaction --routines --triggers --set-gtid-purged=OFF"
+
+    databases = [str(db) for db in list(job_config.get("databases") or [])]
+    if not databases and job_config.get("database"):
+        databases = [str(job_config["database"])]
+    exclude = [
+        str(db)
+        for db in list(
+            job_config.get("exclude_dbs")
+            or ["mysql", "information_schema", "performance_schema", "sys"]
+        )
+    ]
+
+    if databases:
+        db_args = "--databases " + " ".join(shlex.quote(d) for d in databases)
+        dump = f"{mysqldump} {conn} {dump_opts} {db_args}"
+    else:
+        excl = "|".join(re.escape(d) for d in exclude)
+        list_cmd = f"{mysql_bin} {conn} -N -e 'SHOW DATABASES'"
+        dump = (
+            f"DBS=$({list_cmd} 2>/dev/null | grep -Ev \"^({excl})$\" | tr '\\n' ' '); "
+            f"{mysqldump} {conn} {dump_opts} --databases $DBS"
+        )
+
+    return (
+        f"{dump} | gzip > {shlex.quote(remote_out)} "
+        f"&& md5sum {shlex.quote(remote_out)} > {shlex.quote(remote_md5)}"
+    )
+
+
 def _backup_mysql_password(
     job_config: dict[str, Any],
     target_disk: str,
@@ -218,15 +277,15 @@ def _backup_mysql_password(
     job_name = _safe_job_name(job_config)
     local_path = _backup_path(target_disk, job_name, "mysql", backup_type, "sql.gz")
     local_md5_path = local_path + ".md5"
-    remote_path = f"/tmp/{job_name}_{_date_stamp()}_{_suffix_for('mysql', backup_type)}.sql.gz"
+    temp_data = str(job_config.get("temp_data", "/tmp")).rstrip("/") or "/tmp"
+    remote_path = f"{temp_data}/{job_name}_{_date_stamp()}_{_suffix_for('mysql', backup_type)}.sql.gz"
     remote_md5_path = remote_path + ".md5"
 
     try:
         ssh_host = str(job_config["ssh_host"])
         ssh_user = str(job_config["ssh_user"])
         ssh_password = str(job_config["ssh_password"])
-        database = str(job_config["database"])
-        mysql_user = str(job_config["mysql_user"])
+        str(job_config["mysql_user"])
     except KeyError as err:
         return _result(
             success=False,
@@ -249,11 +308,7 @@ def _backup_mysql_password(
         try:
             quoted_remote = shlex.quote(remote_path)
             quoted_remote_md5 = shlex.quote(remote_md5_path)
-            cmd = (
-                "mysqldump --single-transaction --routines --triggers "
-                f"--set-gtid-purged=OFF -u {shlex.quote(mysql_user)} {shlex.quote(database)} "
-                f"| gzip > {quoted_remote} && md5sum {quoted_remote} > {quoted_remote_md5}"
-            )
+            cmd = _build_mysql_dump_command(job_config, remote_path, remote_md5_path)
             exit_code, _stdout, stderr = connector.exec_command(cmd)
             if exit_code != 0:
                 last_error = stderr.strip() or f"remote mysqldump failed with exit status {exit_code}"

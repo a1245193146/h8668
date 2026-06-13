@@ -10,3 +10,6 @@ backup.pid
 .omo/notepads/
 .omo/run-continuation/
 .omo/boulder.json
+
+# Original config source document (not for repo)
+*.docx
