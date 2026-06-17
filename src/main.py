@@ -6,6 +6,13 @@ No business logic lives here — pure orchestration.
 
 from __future__ import annotations
 
+import os as _os, sys as _sys
+_HERE = _os.path.dirname(_os.path.abspath(__file__))      # .../src
+_ROOT = _os.path.dirname(_HERE)                            # project root
+for _p in (_HERE, _os.path.join(_ROOT, "vendor")):
+    if _os.path.isdir(_p) and _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
 import argparse
 import datetime
 import logging
@@ -68,12 +75,22 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
 
     job_name = str(job.get("name", "<unknown>"))
     backup_type = str(job.get("backup_type", "full"))
+    remote_sqlserver = bool(
+        job.get("type") == "sqlserver"
+        and job.get("host")
+        and config.get("backup_target")
+    )
 
     # 1. Resolve backup directory. Prefer an explicit job path; otherwise find
     # a qualifying target disk and create a per-job directory there.
     backup_dir = job.get("backup_dir")
     if backup_dir:
         backup_dir = str(backup_dir)
+    elif remote_sqlserver:
+        # Server-to-server SQL Server backups are written on the SQL Server
+        # host and pushed directly to storage; the orchestrator machine must
+        # not require a local 2TB staging disk for this path.
+        backup_dir = str(job.get("local_backup_dir", "C:\\sqlbak"))
     else:
         disk_cfg = config.get("disks", {})
         target_disk = _utils.get_target_disk(
@@ -95,21 +112,22 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
             return
         backup_dir = str(Path(target_disk) / job_name)
 
-    try:
-        os.makedirs(backup_dir, exist_ok=True)
-    except OSError as exc:
-        error_msg = f"cannot create backup directory {backup_dir!r}: {exc}"
-        _alerter.alert_backup_failed(job_name, error_msg, config)
-        _update_status(
-            config,
-            job_name,
-            str(job.get("type", "unknown")),
-            backup_type,
-            success=False,
-            audit={"intact": False, "missing_files": [], "recommendation": "force_full"},
-            result={"md5": None, "error_msg": error_msg},
-        )
-        return
+    if not remote_sqlserver:
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+        except OSError as exc:
+            error_msg = f"cannot create backup directory {backup_dir!r}: {exc}"
+            _alerter.alert_backup_failed(job_name, error_msg, config)
+            _update_status(
+                config,
+                job_name,
+                str(job.get("type", "unknown")),
+                backup_type,
+                success=False,
+                audit={"intact": False, "missing_files": [], "recommendation": "force_full"},
+                result={"md5": None, "error_msg": error_msg},
+            )
+            return
 
     # 2. Chain audit + fuse check
     audit = _validator.audit_backup_chain(job, backup_dir)
@@ -125,7 +143,7 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
 
     # 3. Execute backup
     logger.info("Starting %s backup for job=%s → %s", backup_type, job_name, backup_dir)
-    result = _executor.dispatch_backup(job, backup_dir, backup_type)
+    result = _executor.dispatch_backup(job, backup_dir, backup_type, config=config)
 
     if not result.get("success"):
         _alerter.alert_backup_failed(
@@ -145,12 +163,18 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
         return
 
     # 4. MD5 validation
-    validation = _validator.validate_backup_file(result)
+    if result.get("on_storage"):
+        validation = {"valid": True, "actual_md5": result.get("md5")}
+    else:
+        validation = _validator.validate_backup_file(result)
     if not validation.get("valid"):
         # Retry once
         logger.warning("MD5 failed for %s — retrying backup", job_name)
-        result2 = _executor.dispatch_backup(job, backup_dir, backup_type)
-        validation2 = _validator.validate_backup_file(result2)
+        result2 = _executor.dispatch_backup(job, backup_dir, backup_type, config=config)
+        if result2.get("on_storage"):
+            validation2 = {"valid": True, "actual_md5": result2.get("md5")}
+        else:
+            validation2 = _validator.validate_backup_file(result2)
         if not validation2.get("valid"):
             _alerter.alert_md5_mismatch(
                 job_name,
@@ -188,10 +212,10 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
     )
 
     # Push to remote storage if backup_target configured
-    if result.get("success") and result.get("file_path"):
+    if result.get("success") and result.get("file_path") and not result.get("on_storage"):
         backup_target = config.get("backup_target", {})
         if backup_target:
-            _push_to_remote_target(result["file_path"], job_name, config)
+            _push_to_remote_target(str(result["file_path"]), job_name, config)
 
 
 def _push_to_remote_target(local_file: str, job_name: str, config: dict) -> None:

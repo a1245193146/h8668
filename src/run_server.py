@@ -7,6 +7,13 @@ Usage:
 """
 from __future__ import annotations
 
+import os as _os, sys as _sys
+_HERE = _os.path.dirname(_os.path.abspath(__file__))      # .../src
+_ROOT = _os.path.dirname(_HERE)                            # project root
+for _p in (_HERE, _os.path.join(_ROOT, "vendor")):
+    if _os.path.isdir(_p) and _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
 import argparse
 import http.server
 import logging

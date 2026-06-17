@@ -115,6 +115,235 @@ def backup_sqlserver(
     job_config: dict[str, Any],
     target_disk: str,
     backup_type: str = "full",
+    config: dict[str, Any] | None = None,
+) -> BackupResult:
+    """SQL Server backup.
+
+    Uses server-to-server mode when the job describes the SQL Server machine
+    (``host``) and a remote ``backup_target`` is configured; otherwise keeps
+    the legacy local sqlcmd path for backward compatibility.
+    """
+
+    if job_config.get("host") and config and config.get("backup_target"):
+        return _backup_sqlserver_remote(job_config, backup_type, config)
+    return _backup_sqlserver_local(job_config, target_disk, backup_type)
+
+
+def _backup_sqlserver_remote(
+    job_config: dict[str, Any],
+    backup_type: str,
+    config: dict[str, Any],
+) -> BackupResult:
+    """Server-to-server SQL Server backup.
+
+    BACKUP runs on the SQL Server host's own disk, then that host pushes the
+    .bak directly to the storage server's admin share over SMB. The file never
+    transits through the program machine.
+    """
+
+    import importlib
+
+    started_at = time.time()
+    job_name = _safe_job_name(job_config)
+
+    try:
+        connector_mod = importlib.import_module("connector")
+        utils_mod = importlib.import_module("utils")
+    except ImportError as exc:
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg=f"import failed: {exc}",
+        )
+
+    target = config.get("backup_target", {})
+    suffix = _suffix_for("sqlserver", backup_type)
+    filename = f"{job_name}_{_date_stamp()}_{suffix}.bak"
+    local_dir = str(job_config.get("local_backup_dir", "C:\\sqlbak")).rstrip("\\")
+    local_bak = f"{local_dir}\\{filename}"
+    sql_conn: Any | None = None
+    store_conn: Any | None = None
+
+    try:
+        try:
+            sql_conn = connector_mod.WindowsConnector(
+                host=str(job_config["host"]),
+                username=str(job_config.get("os_user", job_config.get("username", ""))),
+                password=str(job_config.get("os_password", job_config.get("password", ""))),
+                domain=str(job_config.get("domain", "")),
+                winrm_port=int(job_config.get("winrm_port", 5985)),
+                ssh_port=int(job_config.get("ssh_port", 22)),
+            )
+        except KeyError as err:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type=backup_type,
+                started_at=started_at,
+                error_msg=f"missing sqlserver machine config field: {err}",
+            )
+
+        store_conn = utils_mod.create_target_connector(config)
+        if store_conn is None:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type=backup_type,
+                started_at=started_at,
+                error_msg="cannot create storage connector",
+            )
+        assert sql_conn is not None
+        assert store_conn is not None
+
+        try:
+            sql_server = str(job_config.get("read_replica") or job_config.get("server", "localhost"))
+            sa_user = str(job_config["auth"]["user"])
+            sa_pw = str(job_config["auth"]["password"])
+            db = str(job_config["database"])
+        except KeyError as err:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type=backup_type,
+                started_at=started_at,
+                error_msg=f"missing sqlserver config field: {err}",
+            )
+
+        mode = "INIT, COMPRESSION" if backup_type == "full" else "DIFFERENTIAL, COMPRESSION"
+        ps_backup = (
+            f"if (-not (Test-Path {_ps_single_quote(local_dir)})) "
+            f"{{ New-Item -ItemType Directory -Force {_ps_single_quote(local_dir)} | Out-Null }}; "
+            f"sqlcmd -S {sql_server} -U {sa_user} -P {_ps_single_quote(sa_pw)} "
+            f"-Q \"BACKUP DATABASE [{db}] TO DISK=N'{local_bak}' WITH {mode}\""
+        )
+        code, out, err = sql_conn.exec_command(ps_backup)
+        if code != 0:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type=backup_type,
+                started_at=started_at,
+                error_msg=f"remote BACKUP failed: {(err or out)[:300]}",
+            )
+
+        code, src_md5_out, err = sql_conn.exec_command(
+            f"(Get-FileHash -Algorithm MD5 {_ps_single_quote(local_bak)}).Hash.ToLower()"
+        )
+        src_md5 = src_md5_out.strip().splitlines()[-1].strip() if src_md5_out.strip() else ""
+        if code != 0 or len(src_md5) != 32:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type=backup_type,
+                started_at=started_at,
+                error_msg=f"source MD5 failed: {(err or src_md5_out)[:200]}",
+            )
+
+        target_drive = utils_mod.get_remote_target_disk(
+            store_conn,
+            min_size_tb=float(target.get("min_size_tb", 2)),
+            min_free_gb=float(target.get("min_free_gb", 100)),
+        )
+        if not target_drive:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type=backup_type,
+                started_at=started_at,
+                error_msg="no storage disk with >2TB total and >100GB free",
+            )
+
+        base_path = str(target.get("base_path", "E:\\Backups"))
+        base_sub = base_path.split(":", 1)[1].lstrip("\\") if ":" in base_path else base_path.strip("\\")
+        drive_letter = str(target_drive).rstrip("\\").rstrip(":")
+        admin_share = f"{drive_letter}$"
+        storage_ip = str(target["host"])
+        store_domain = str(target.get("domain", ""))
+        store_user = str(target.get("username", ""))
+        store_pw = str(target.get("password", ""))
+        full_user = f"{store_domain}\\{store_user}" if store_domain else store_user
+        unc_dir = f"\\\\{storage_ip}\\{admin_share}\\{base_sub}\\{job_name}"
+        unc_file = f"{unc_dir}\\{filename}"
+        local_dest_for_hash = f"{drive_letter}:\\{base_sub}\\{job_name}\\{filename}"
+
+        share_path = f"\\\\{storage_ip}\\{admin_share}"
+        ps_copy = (
+            f"net use {share_path} {_ps_single_quote(store_pw)} /user:{full_user} | Out-Null; "
+            f"if (-not (Test-Path {_ps_single_quote(unc_dir)})) "
+            f"{{ New-Item -ItemType Directory -Force {_ps_single_quote(unc_dir)} | Out-Null }}; "
+            f"Copy-Item -Path {_ps_single_quote(local_bak)} -Destination {_ps_single_quote(unc_file)} -Force; "
+            f"$ok = Test-Path {_ps_single_quote(unc_file)}; "
+            f"net use {share_path} /delete /y | Out-Null; "
+            "if ($ok) { Write-Output 'COPY_OK' } else { Write-Output 'COPY_FAIL' }"
+        )
+        code, copy_out, err = sql_conn.exec_command(ps_copy)
+        if code != 0 or "COPY_OK" not in copy_out:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type=backup_type,
+                started_at=started_at,
+                error_msg=f"SMB copy failed: {(err or copy_out)[:300]}",
+            )
+
+        code, dst_md5_out, err = store_conn.exec_command(
+            f"(Get-FileHash -Algorithm MD5 {_ps_single_quote(local_dest_for_hash)}).Hash.ToLower()"
+        )
+        dst_md5 = dst_md5_out.strip().splitlines()[-1].strip() if dst_md5_out.strip() else ""
+        if code != 0 or dst_md5 != src_md5:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type=backup_type,
+                started_at=started_at,
+                error_msg=f"MD5 mismatch src={src_md5} dst={dst_md5}",
+            )
+
+        store_conn.exec_command(
+            f"Set-Content -Path {_ps_single_quote(local_dest_for_hash + '.md5')} "
+            f"-Value {_ps_single_quote(dst_md5)} -NoNewline"
+        )
+        sql_conn.exec_command(
+            f"Remove-Item -Force {_ps_single_quote(local_bak)} -ErrorAction SilentlyContinue"
+        )
+
+        res = _result(
+            success=True,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            file_path=local_dest_for_hash,
+            md5=dst_md5,
+        )
+        res["on_storage"] = True
+        return res
+    except Exception as exc:  # noqa: BLE001 - executor must convert all failures into BackupResult.
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type=backup_type,
+            started_at=started_at,
+            error_msg=f"unexpected: {exc}",
+        )
+    finally:
+        if sql_conn is not None:
+            try:
+                sql_conn.close()
+            except Exception:
+                pass
+        if store_conn is not None:
+            try:
+                store_conn.close()
+            except Exception:
+                pass
+
+
+def _backup_sqlserver_local(
+    job_config: dict[str, Any],
+    target_disk: str,
+    backup_type: str = "full",
 ) -> BackupResult:
     """Run SQL Server BACKUP DATABASE through sqlcmd and return a BackupResult."""
 
@@ -972,12 +1201,13 @@ def dispatch_backup(
     job_config: dict[str, Any],
     target_disk: str,
     backup_type: str = "full",
+    config: dict[str, Any] | None = None,
 ) -> BackupResult:
     t = job_config.get("type")
     if t == "file" and "os" in job_config:
         return backup_remote_files(job_config, target_disk, backup_type)
     if t == "sqlserver":
-        return backup_sqlserver(job_config, target_disk, backup_type)
+        return backup_sqlserver(job_config, target_disk, backup_type, config=config)
     if t == "mysql":
         return backup_mysql(job_config, target_disk, backup_type)
     if t == "sqlite":
