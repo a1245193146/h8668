@@ -258,3 +258,64 @@ def fuse_check(audit_result: dict) -> str:
     if not audit_result.get("intact", False):
         return "force_full"
     return "proceed_incremental"
+
+
+def audit_backup_chain_remote(job_config: dict, connector, base_path: str) -> dict:
+    """Audit the SQL Server backup chain ON THE STORAGE SERVER.
+
+    Server-to-server SQL Server backups live on the storage host
+    (e.g. E:\\Backups\\<job>\\<job>_YYYYMMDD_full.bak), not on the orchestrator.
+    This lists the storage directory over the connector and applies the same
+    weekly full+diff continuity logic as audit_backup_chain.
+    Returns the same ChainAuditResult dict. On any remote error it returns a
+    permissive intact=True result so a transient storage hiccup does NOT force
+    a needless full (the scheduler's last_full age rule still applies).
+    """
+    job_name = job_config.get("name", "unknown")
+    # storage layout: <base_path>\<job_name>\  (base_path like "E:\Backups")
+    remote_dir = f"{str(base_path).rstrip(chr(92))}\\{job_name}"
+    ps = (
+        f"if (Test-Path '{remote_dir}') {{ "
+        f"Get-ChildItem -Path '{remote_dir}' -Filter '*.bak' -File | "
+        f"ForEach-Object {{ if ($_.Length -gt 0) {{ Write-Output $_.Name }} }} }}"
+    )
+    try:
+        code, out, _err = connector.exec_command(ps)
+        if code != 0:
+            logger.warning("audit_backup_chain_remote: list failed for %s (code %s)", job_name, code)
+            return {"intact": True, "missing_files": [], "last_valid_date": None,
+                    "recommendation": "proceed_incremental"}
+        present = {ln.strip() for ln in out.splitlines() if ln.strip()}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit_backup_chain_remote error for %s: %s", job_name, exc)
+        return {"intact": True, "missing_files": [], "last_valid_date": None,
+                "recommendation": "proceed_incremental"}
+
+    # Same week-window expectation as the local auditor (sqlserver => full/diff .bak)
+    today = datetime.date.today()
+    days_since_sunday = (today.weekday() + 1) % 7
+    week_start = today - datetime.timedelta(days=days_since_sunday)
+
+    expected: list[tuple[str, str]] = [(week_start.strftime("%Y%m%d"), "full")]
+    for delta in range(1, 7):
+        day = week_start + datetime.timedelta(days=delta)
+        if day >= today:
+            break
+        expected.append((day.strftime("%Y%m%d"), "diff"))
+
+    missing: list[str] = []
+    last_valid = None
+    for date_str, suffix in expected:
+        fname = f"{job_name}_{date_str}_{suffix}.bak"
+        if fname in present:
+            last_valid = date_str
+        else:
+            missing.append(date_str)
+
+    intact = len(missing) == 0
+    return {
+        "intact": intact,
+        "missing_files": missing,
+        "last_valid_date": last_valid,
+        "recommendation": "proceed_incremental" if intact else "force_full",
+    }

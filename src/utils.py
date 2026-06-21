@@ -328,6 +328,18 @@ def write_status(data: dict, path: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
         os.replace(tmp_path, str(dest))
+        # Mirror into the dashboard directory so the web UI shows live data.
+        try:
+            _here = Path(__file__).resolve().parent          # src/
+            _dash = _here.parent / "dashboard"               # project_root/dashboard
+            if _dash.is_dir():
+                mirror = _dash / "backup_status.json"
+                # only mirror if we're not already writing into dashboard/
+                if mirror.resolve() != dest.resolve():
+                    with open(mirror, "w", encoding="utf-8") as mf:
+                        json.dump(data, mf, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
         logger.debug("write_status: wrote %s", path)
     except Exception:
         try:

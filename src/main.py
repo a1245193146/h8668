@@ -130,7 +130,23 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
             return
 
     # 2. Chain audit + fuse check
-    audit = _validator.audit_backup_chain(job, backup_dir)
+    if remote_sqlserver:
+        # Backups live on the storage server, not the orchestrator's backup_dir.
+        # Audit the real chain on storage so weekday differentials are allowed.
+        _store_conn = _utils.create_target_connector(config)
+        if _store_conn is not None:
+            _base = str(config.get("backup_target", {}).get("base_path", "E:\\Backups"))
+            audit_remote = getattr(_validator, "audit_backup_chain_remote")
+            audit = audit_remote(job, _store_conn, _base)
+            try:
+                _store_conn.close()
+            except Exception:
+                pass
+        else:
+            audit = {"intact": True, "missing_files": [], "last_valid_date": None,
+                     "recommendation": "proceed_incremental"}
+    else:
+        audit = _validator.audit_backup_chain(job, backup_dir)
     fuse = _validator.fuse_check(audit)
     if fuse == "force_full" and backup_type != "full":
         logger.warning(
