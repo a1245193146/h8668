@@ -27,6 +27,7 @@ import config as _config_mod
 import executor as _executor
 import scheduler as _scheduler
 import restore_verifier as _restore_verifier
+import storage_status as _storage_status
 import utils as _utils
 import validator as _validator
 
@@ -64,6 +65,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--verify-restore",
         action="store_true",
         help="Force run monthly restore verification now",
+    )
+    p.add_argument(
+        "--refresh-status",
+        action="store_true",
+        help="Scan real storage backup tree and refresh dashboard status now",
     )
     return p
 
@@ -348,7 +354,6 @@ def run_once(config: dict[str, Any], job_filter: str | None = None) -> None:
         jobs = [j for j in jobs if j.get("name") == job_filter]
         if not jobs:
             logger.warning("No enabled job named %r found in config", job_filter)
-            return
 
     for job in jobs:
         _run_job(job, config)
@@ -359,6 +364,12 @@ def run_once(config: dict[str, Any], job_filter: str | None = None) -> None:
     if _restore_verifier.is_verification_day(config):
         logger.info("Monthly verification day — running restore verification")
         _restore_verifier.run_monthly_verification(config)
+
+    # Refresh dashboard from the real storage backup tree
+    try:
+        _storage_status.refresh_dashboard_status(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dashboard refresh failed: %s", exc)
 
 
 def dry_run(config: dict[str, Any], job_filter: str | None = None) -> None:
@@ -471,6 +482,11 @@ def main() -> int:
                       f"duration={r['duration_seconds']:.1f}s "
                       f"error={r.get('error_msg','')[:60] if not r['success'] else ''}")
             return 0
+
+        if args.refresh_status:
+            ok = _storage_status.refresh_dashboard_status(cfg)
+            print("[OK] Dashboard status refreshed from storage" if ok else "[ERROR] Dashboard status refresh failed")
+            return 0 if ok else 1
 
         if args.once:
             run_once(cfg, args.job)

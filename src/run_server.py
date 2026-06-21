@@ -4,6 +4,7 @@ Usage:
   python src/run_server.py                      # serve only (dashboard-only mode)
   python src/run_server.py --dashboard-only     # same
   python src/run_server.py --port 9090          # custom port
+  python src/run_server.py --config config.json # serve + refresh from storage
 """
 from __future__ import annotations
 
@@ -32,7 +33,45 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Only start the HTTP server (default behaviour)")
     p.add_argument("--port", type=int, default=8080, help="HTTP port (default: 8080)")
     p.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    p.add_argument(
+        "--config",
+        help="Config JSON path; when given, refresh dashboard from storage every 5 minutes",
+    )
     return p
+
+
+def _start_refresh_thread(config_path: str) -> None:
+    import threading
+    import time
+
+    import config as _config_mod
+    import storage_status as _ss
+
+    abs_config_path = os.path.abspath(config_path)
+
+    def _loop() -> None:
+        try:
+            cfg = _config_mod.load_config(abs_config_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("run_server: cannot load config %s: %s", abs_config_path, exc)
+            return
+        cfg["_config_path"] = abs_config_path
+        try:
+            _ss.refresh_dashboard_status(cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("initial status refresh failed: %s", exc)
+        while True:
+            time.sleep(300)
+            try:
+                cfg = _config_mod.load_config(abs_config_path)
+                cfg["_config_path"] = abs_config_path
+                _ss.refresh_dashboard_status(cfg)
+                logger.info("dashboard status refreshed from storage")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("status refresh failed: %s", exc)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
 
 
 def serve(host: str = "127.0.0.1", port: int = 8080, dashboard_dir: str | None = None) -> None:
@@ -67,6 +106,8 @@ def serve(host: str = "127.0.0.1", port: int = 8080, dashboard_dir: str | None =
 def main() -> int:
     args = _build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    if args.config:
+        _start_refresh_thread(os.path.abspath(args.config))
     serve(host=args.host, port=args.port)
     return 0
 
