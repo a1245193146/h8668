@@ -427,16 +427,194 @@ def backup_mysql(
     job_config: dict[str, Any],
     target_disk: str,
     backup_type: str = "full",
+    config: dict[str, Any] | None = None,
 ) -> BackupResult:
-    """Run mysqldump on a remote host over SSH and pull it via SFTP.
+    """MySQL backup.
 
-    Routes to the V2 password-based path (SSHPasswordConnector) when
-    ``ssh_password`` is present in job_config, or falls back to the V1
-    paramiko key-file path when ``ssh_key`` is present.
+    Server-to-server mode (SSH + mysqldump + smbclient to storage) is used when
+    ``ssh_password`` and a configured ``backup_target`` are present. Otherwise
+    the legacy password/key download paths are preserved.
     """
+    backup_type = "full"
+    if config and config.get("backup_target") and job_config.get("ssh_password"):
+        return _backup_mysql_remote(job_config, config)
     if "ssh_password" in job_config:
         return _backup_mysql_password(job_config, target_disk, backup_type)
     return _backup_mysql_keyauth(job_config, target_disk, backup_type)
+
+
+def _backup_mysql_remote(job_config: dict[str, Any], config: dict[str, Any]) -> BackupResult:
+    """Run a full MySQL dump on Linux and push it directly to Windows storage."""
+
+    import importlib
+
+    started_at = time.time()
+    job_name = _safe_job_name(job_config)
+    date = _date_stamp()
+    filename = f"{job_name}_{date}_full.sql.gz"
+    temp_data = str(job_config.get("temp_data", "/tmp")).rstrip("/") or "/tmp"
+    remote_dump = f"{temp_data}/{filename}"
+    remote_md5 = remote_dump + ".md5"
+    ssh_conn: Any | None = None
+    store_conn: Any | None = None
+
+    try:
+        connector_mod = importlib.import_module("connector")
+        utils_mod = importlib.import_module("utils")
+    except ImportError as exc:
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type="full",
+            started_at=started_at,
+            error_msg=f"import failed: {exc}",
+        )
+
+    target = config.get("backup_target", {})
+    try:
+        ssh_host = str(job_config["ssh_host"])
+        ssh_user = str(job_config["ssh_user"])
+        ssh_password = str(job_config["ssh_password"])
+        str(job_config["mysql_user"])
+    except KeyError as err:
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type="full",
+            started_at=started_at,
+            error_msg=f"missing mysql field: {err}",
+        )
+
+    try:
+        ssh_conn = connector_mod.SSHPasswordConnector(
+            host=ssh_host,
+            username=ssh_user,
+            password=ssh_password,
+            port=int(job_config.get("ssh_port", 22)),
+            max_retries=3,
+            retry_delay=30,
+        )
+        store_conn = utils_mod.create_target_connector(config)
+        if store_conn is None:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type="full",
+                started_at=started_at,
+                error_msg="cannot create storage connector",
+            )
+
+        dump_cmd = _build_mysql_dump_command(job_config, remote_dump, remote_md5)
+        code, _out, err = ssh_conn.exec_command(dump_cmd)
+        if code != 0:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type="full",
+                started_at=started_at,
+                error_msg=f"mysqldump failed: {(err or '')[:300]}",
+            )
+
+        code, md5_out, err = ssh_conn.exec_command(f"cat {shlex.quote(remote_md5)}")
+        src_md5 = (md5_out.strip().split() or [""])[0].lower()
+        if code != 0 or len(src_md5) != 32:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type="full",
+                started_at=started_at,
+                error_msg=f"source md5 failed: {(err or md5_out)[:200]}",
+            )
+
+        target_drive = utils_mod.get_remote_target_disk(
+            store_conn,
+            min_size_tb=float(target.get("min_size_tb", 2)),
+            min_free_gb=float(target.get("min_free_gb", 100)),
+        )
+        if not target_drive:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type="full",
+                started_at=started_at,
+                error_msg="no storage disk with >2TB total and >100GB free",
+            )
+
+        base_path = str(target.get("base_path", "E:\\Backups"))
+        base_sub = base_path.split(":", 1)[1].lstrip("\\") if ":" in base_path else base_path.strip("\\")
+        drive_letter = str(target_drive).rstrip("\\").rstrip(":")
+        admin_share = f"{drive_letter}$"
+        storage_ip = str(target["host"])
+        store_domain = str(target.get("domain", ""))
+        store_user = str(target.get("username", ""))
+        store_pw = str(target.get("password", ""))
+        smb_user = f"{store_domain}\\{store_user}" if store_domain else store_user
+        rel_dir = f"{base_sub}\\{job_name}"
+        smb_script = (
+            f'prompt OFF; mkdir "{base_sub}"; mkdir "{rel_dir}"; cd "{rel_dir}"; '
+            f'put {remote_dump} "{filename}"; put {remote_md5} "{filename}.md5"'
+        )
+        smb_cmd = (
+            f"smbclient //{storage_ip}/{admin_share} -U {shlex.quote(smb_user + '%' + store_pw)} "
+            f"-c {shlex.quote(smb_script)} 2>&1; echo SMB_DONE"
+        )
+        _code, smb_out, _err = ssh_conn.exec_command(smb_cmd)
+        if "NT_STATUS" in (smb_out or "") and "putting file" not in (smb_out or "").lower():
+            bad_lines = [line for line in smb_out.splitlines() if "NT_STATUS" in line and "COLLISION" not in line]
+            if bad_lines:
+                return _result(
+                    success=False,
+                    job_name=job_name,
+                    backup_type="full",
+                    started_at=started_at,
+                    error_msg=f"smbclient push failed: {bad_lines[0][:200]}",
+                )
+
+        dest = f"{drive_letter}:\\{base_sub}\\{job_name}\\{filename}"
+        code, dst_md5_out, err = store_conn.exec_command(
+            f"(Get-FileHash -Algorithm MD5 {_ps_single_quote(dest)}).Hash.ToLower()"
+        )
+        dst_md5 = dst_md5_out.strip().splitlines()[-1].strip() if dst_md5_out.strip() else ""
+        if code != 0 or dst_md5 != src_md5:
+            return _result(
+                success=False,
+                job_name=job_name,
+                backup_type="full",
+                started_at=started_at,
+                error_msg=f"storage md5 mismatch src={src_md5} dst={dst_md5}",
+            )
+
+        ssh_conn.exec_command(f"rm -f {shlex.quote(remote_dump)} {shlex.quote(remote_md5)}")
+
+        result = _result(
+            success=True,
+            job_name=job_name,
+            backup_type="full",
+            started_at=started_at,
+            file_path=dest,
+            md5=dst_md5,
+        )
+        result["on_storage"] = True
+        return result
+    except Exception as exc:  # noqa: BLE001 - executor must convert all failures into BackupResult.
+        return _result(
+            success=False,
+            job_name=job_name,
+            backup_type="full",
+            started_at=started_at,
+            error_msg=f"unexpected: {exc}",
+        )
+    finally:
+        if ssh_conn is not None:
+            try:
+                ssh_conn.close()
+            except Exception:
+                pass
+        if store_conn is not None:
+            try:
+                store_conn.close()
+            except Exception:
+                pass
 
 
 def _build_mysql_dump_command(
@@ -1209,7 +1387,7 @@ def dispatch_backup(
     if t == "sqlserver":
         return backup_sqlserver(job_config, target_disk, backup_type, config=config)
     if t == "mysql":
-        return backup_mysql(job_config, target_disk, backup_type)
+        return backup_mysql(job_config, target_disk, backup_type, config=config)
     if t == "sqlite":
         return backup_sqlite(job_config, target_disk, backup_type)
     if t == "file":

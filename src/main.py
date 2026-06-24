@@ -86,16 +86,21 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
         and job.get("host")
         and config.get("backup_target")
     )
+    remote_mysql = bool(
+        job.get("type") == "mysql"
+        and job.get("ssh_password")
+        and config.get("backup_target")
+    )
+    remote_s2s = remote_sqlserver or remote_mysql
 
     # 1. Resolve backup directory. Prefer an explicit job path; otherwise find
     # a qualifying target disk and create a per-job directory there.
     backup_dir = job.get("backup_dir")
     if backup_dir:
         backup_dir = str(backup_dir)
-    elif remote_sqlserver:
-        # Server-to-server SQL Server backups are written on the SQL Server
-        # host and pushed directly to storage; the orchestrator machine must
-        # not require a local 2TB staging disk for this path.
+    elif remote_s2s:
+        # Server-to-server backups are written on the database host and pushed
+        # directly to storage; the orchestrator must not require local staging.
         backup_dir = str(job.get("local_backup_dir", "C:\\sqlbak"))
     else:
         disk_cfg = config.get("disks", {})
@@ -118,7 +123,7 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
             return
         backup_dir = str(Path(target_disk) / job_name)
 
-    if not remote_sqlserver:
+    if not remote_s2s:
         try:
             os.makedirs(backup_dir, exist_ok=True)
         except OSError as exc:
@@ -151,6 +156,9 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
         else:
             audit = {"intact": True, "missing_files": [], "last_valid_date": None,
                      "recommendation": "proceed_incremental"}
+    elif remote_mysql:
+        audit = {"intact": True, "missing_files": [], "last_valid_date": None,
+                 "recommendation": "proceed_incremental"}
     else:
         audit = _validator.audit_backup_chain(job, backup_dir)
     fuse = _validator.fuse_check(audit)

@@ -178,16 +178,18 @@ def get_chain_files(
     # Build expected filenames for each day in the week up to yesterday
     expected: list[tuple[str, str]] = []  # (date_str, suffix)
 
-    # Sunday = full backup
+    # Sunday = full backup (always required)
     full_date = week_start_date
     expected.append((full_date.strftime("%Y%m%d"), suffixes["full"]))
 
-    # Monday through yesterday = incremental
-    for delta in range(1, 7):
-        day = week_start_date + datetime.timedelta(days=delta)
-        if day >= today:
-            break
-        expected.append((day.strftime("%Y%m%d"), suffixes["incr"]))
+    # For SQL Server, differentials are cumulative — only the full is required.
+    # For other types, each weekday increment is part of the chain.
+    if backup_type != "sqlserver":
+        for delta in range(1, 7):
+            day = week_start_date + datetime.timedelta(days=delta)
+            if day >= today:
+                break
+            expected.append((day.strftime("%Y%m%d"), suffixes["incr"]))
 
     found: list[str] = []
     missing: list[str] = []
@@ -291,31 +293,17 @@ def audit_backup_chain_remote(job_config: dict, connector, base_path: str) -> di
         return {"intact": True, "missing_files": [], "last_valid_date": None,
                 "recommendation": "proceed_incremental"}
 
-    # Same week-window expectation as the local auditor (sqlserver => full/diff .bak)
+    # SQL Server differentials are CUMULATIVE (each diff = all changes since the
+    # weekly full), so the chain is intact as long as THIS WEEK'S FULL exists.
+    # Missing intermediate diffs do NOT break the chain.
     today = datetime.date.today()
-    days_since_sunday = (today.weekday() + 1) % 7
-    week_start = today - datetime.timedelta(days=days_since_sunday)
-
-    expected: list[tuple[str, str]] = [(week_start.strftime("%Y%m%d"), "full")]
-    for delta in range(1, 7):
-        day = week_start + datetime.timedelta(days=delta)
-        if day >= today:
-            break
-        expected.append((day.strftime("%Y%m%d"), "diff"))
-
-    missing: list[str] = []
-    last_valid = None
-    for date_str, suffix in expected:
-        fname = f"{job_name}_{date_str}_{suffix}.bak"
-        if fname in present:
-            last_valid = date_str
-        else:
-            missing.append(date_str)
-
-    intact = len(missing) == 0
+    week_start = today - datetime.timedelta(days=(today.weekday() + 1) % 7)
+    full_date = week_start.strftime("%Y%m%d")
+    full_name = f"{job_name}_{full_date}_full.bak"
+    intact = full_name in present
     return {
         "intact": intact,
-        "missing_files": missing,
-        "last_valid_date": last_valid,
+        "missing_files": [] if intact else [full_date],
+        "last_valid_date": full_date if intact else None,
         "recommendation": "proceed_incremental" if intact else "force_full",
     }

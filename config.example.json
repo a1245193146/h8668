@@ -34,7 +34,6 @@
       "temp_data": "/data/mysql",
       "databases": [],
       "exclude_dbs": ["mysql", "information_schema", "performance_schema", "sys"],
-      "backup_dir": "D:\\backups\\mysql_138",
       "schedule_time": "02:30"
     },
     {
@@ -54,7 +53,6 @@
       "temp_data": "/data/mysql",
       "databases": ["td_oa"],
       "exclude_dbs": ["mysql", "information_schema", "performance_schema", "sys"],
-      "backup_dir": "D:\\backups\\mysql_oa",
       "schedule_time": "02:45"
     },
     {
@@ -66,7 +64,6 @@
       "ssh_password": "<ssh-password>",
       "database": "analytics",
       "mysql_user": "backup_user",
-      "backup_dir": "D:\\backups\\mysql_analytics",
       "schedule_time": "03:00"
     },
     {
