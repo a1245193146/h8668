@@ -432,11 +432,13 @@ def backup_mysql(
     """MySQL backup.
 
     Server-to-server mode (SSH + mysqldump + smbclient to storage) is used when
-    ``ssh_password`` and a configured ``backup_target`` are present. Otherwise
-    the legacy password/key download paths are preserved.
+    a configured ``backup_target`` and complete SSH password credentials are
+    present. Otherwise the legacy password/key download paths are preserved.
     """
-    backup_type = "full"
-    if config and config.get("backup_target") and job_config.get("ssh_password"):
+    has_target = bool(config and config.get("backup_target"))
+    has_ssh = all(job_config.get(k) for k in ("ssh_host", "ssh_user", "ssh_password"))
+    if has_target and has_ssh:
+        assert config is not None
         return _backup_mysql_remote(job_config, config)
     if "ssh_password" in job_config:
         return _backup_mysql_password(job_config, target_disk, backup_type)
@@ -503,6 +505,7 @@ def _backup_mysql_remote(job_config: dict[str, Any], config: dict[str, Any]) -> 
                 started_at=started_at,
                 error_msg="cannot create storage connector",
             )
+        assert ssh_conn is not None
 
         dump_cmd = _build_mysql_dump_command(job_config, remote_dump, remote_md5)
         code, _out, err = ssh_conn.exec_command(dump_cmd)

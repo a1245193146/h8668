@@ -88,8 +88,10 @@ def _run_job(job: dict[str, Any], config: dict[str, Any]) -> None:
     )
     remote_mysql = bool(
         job.get("type") == "mysql"
-        and job.get("ssh_password")
         and config.get("backup_target")
+        and job.get("ssh_host")
+        and job.get("ssh_user")
+        and job.get("ssh_password")
     )
     remote_s2s = remote_sqlserver or remote_mysql
 
@@ -313,8 +315,10 @@ def _update_status(
 
     if backup_type == "full":
         entry["last_full"] = now_iso
+        entry["increments_since_full"] = 0
     else:
         entry["last_incremental"] = now_iso
+        entry["increments_since_full"] = int(entry.get("increments_since_full", 0)) + 1
 
     if success:
         entry["file_path"] = result.get("file_path")

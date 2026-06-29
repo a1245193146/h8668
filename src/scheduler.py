@@ -1,10 +1,10 @@
 """scheduler.py — Backup schedule decision module.
 
-Determines whether to run full or incremental backups based on:
-- Day of week (Sunday → full)
-- Chain status (broken → full)
-- Last full backup age (>= 7 days → full)
+Determines whether to run full or incremental backups based on a rolling
+7-run cycle:
 - History presence (no history → full / first run)
+- Last full presence
+- Increments since the last full (6 increments → next run is full)
 
 No imports from executor.py, validator.py, or alerter.py.
 No external scheduling libraries (APScheduler, celery, cron).
@@ -30,86 +30,34 @@ def should_run_full_backup(job_config: dict, history: dict) -> bool:
     Returns True if today should be a FULL backup for this job.
     Conditions (any):
     - history is empty (no previous backups)
-    - today is Sunday (weekday() == 6)
-    - history['chain_status'] == 'broken'
-    - history['last_full'] is missing or older than 7 days
-    Uses UTC time internally.
+    - history['last_full'] is missing
+    - history['increments_since_full'] is >= 6
     """
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-
-    # No history at all → first run → full
     if not history:
         return True
 
-    # Sunday → always full
-    if now_utc.weekday() == 6:
-        return True
-
-    # Broken chain → full
-    if history.get("chain_status") == "broken":
-        return True
-
-    # last_full missing or older than 7 days → full
-    last_full_str = history.get("last_full")
-    if not last_full_str:
+    if not history.get("last_full"):
         return True
 
     try:
-        last_full = datetime.datetime.fromisoformat(
-            last_full_str.replace("Z", "+00:00")
-        )
-        if (now_utc - last_full).days >= 7:
-            return True
+        return int(history.get("increments_since_full", 0)) >= 6
     except (ValueError, TypeError):
-        # Unparseable timestamp → assume stale → full
         logger.warning(
-            "should_run_full_backup: cannot parse last_full=%r for job %r — forcing full",
-            last_full_str,
+            "should_run_full_backup: cannot parse increments_since_full=%r for job %r — forcing full",
+            history.get("increments_since_full"),
             job_config.get("name", "<unknown>"),
         )
         return True
-
-    return False
 
 
 def should_run_incremental(job_config: dict, history: dict) -> bool:
     """
     Returns True if today should be an INCREMENTAL backup.
-    Conditions (all must hold):
-    - today is NOT Sunday
-    - chain is NOT broken
-    - last_full exists and is within this week
+    Conditions: a full exists and fewer than 6 increments have run after it.
     """
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-
-    # Must not be Sunday
-    if now_utc.weekday() == 6:
+    if not history or not history.get("last_full"):
         return False
-
-    # Chain must not be broken
-    if history.get("chain_status") == "broken":
-        return False
-
-    # last_full must exist and be within the last 7 days
-    last_full_str = history.get("last_full")
-    if not last_full_str:
-        return False
-
-    try:
-        last_full = datetime.datetime.fromisoformat(
-            last_full_str.replace("Z", "+00:00")
-        )
-        if (now_utc - last_full).days >= 7:
-            return False
-    except (ValueError, TypeError):
-        logger.warning(
-            "should_run_incremental: cannot parse last_full=%r for job %r — skipping incremental",
-            last_full_str,
-            job_config.get("name", "<unknown>"),
-        )
-        return False
-
-    return True
+    return not should_run_full_backup(job_config, history)
 
 
 def get_today_schedule(config: dict, status: dict | None = None) -> list[dict]:
@@ -117,12 +65,8 @@ def get_today_schedule(config: dict, status: dict | None = None) -> list[dict]:
     Returns list of jobs to run today, with backup_type resolved.
     Each item: {**job_config, 'backup_type': 'full'|'incremental', 'history': {...}}
     Only includes enabled jobs.
-    Uses UTC now to determine day-of-week.
     status: the current backup_status.json dict (or None if first run)
     """
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    is_sunday = now_utc.weekday() == 6
-
     # Build name → history dict from status['jobs'] list
     history_by_name: dict[str, dict] = {}
     if status and "jobs" in status:
@@ -140,22 +84,10 @@ def get_today_schedule(config: dict, status: dict | None = None) -> list[dict]:
         job_name = job_config.get("name", "")
         history = history_by_name.get(job_name, {})
 
-        # Resolve backup_type following priority rules
-        if is_sunday:
+        if should_run_full_backup(job_config, history):
             backup_type = "full"
-        elif not history:
-            # First run for this job (no history entry)
-            backup_type = "full"
-        elif history.get("chain_status") == "broken":
-            # Broken chain always forces full
-            backup_type = "full"
-        elif should_run_full_backup(job_config, history):
-            backup_type = "full"
-        elif should_run_incremental(job_config, history):
-            backup_type = "incremental"
         else:
-            # Safe fallback: if neither condition matches, do full
-            backup_type = "full"
+            backup_type = "incremental"
 
         result.append(
             {
@@ -166,9 +98,8 @@ def get_today_schedule(config: dict, status: dict | None = None) -> list[dict]:
         )
 
     logger.debug(
-        "get_today_schedule: %d enabled jobs, is_sunday=%s",
+        "get_today_schedule: %d enabled jobs",
         len(result),
-        is_sunday,
     )
     return result
 
@@ -287,14 +218,6 @@ def _resolve_backup_type(
     now_utc: datetime.datetime,
 ) -> str:
     """Determine 'full' or 'incremental' for a single job given a fixed UTC instant."""
-    if now_utc.weekday() == 6:
-        return "full"
-    if not history:
-        return "full"
-    if history.get("chain_status") == "broken":
-        return "full"
     if should_run_full_backup(job_config, history):
         return "full"
-    if should_run_incremental(job_config, history):
-        return "incremental"
-    return "full"  # safe fallback
+    return "incremental"

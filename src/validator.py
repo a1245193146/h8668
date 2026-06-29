@@ -160,55 +160,30 @@ _BACKUP_EXTENSIONS = {
 def get_chain_files(
     job_name: str,
     backup_dir: str,
-    week_start_date: datetime.date,
     backup_type: str,
 ) -> tuple[list[str], list[str]]:
     """
-    Scan backup_dir for this week's backup files for a given job.
-
-    week_start_date: the Sunday of this week (first day of backup chain).
+    Scan backup_dir for non-empty full backup files for a given job.
 
     Returns (found_files, missing_dates):
-    - found_files: list of absolute paths that exist and are >0 bytes, ordered by date
-    - missing_dates: list of "YYYYMMDD" strings for expected dates with no valid file
+    - found_files: list of absolute full backup paths, ordered by date
+    - missing_dates: ["full"] when no valid full exists
     """
     ext, suffixes = _BACKUP_EXTENSIONS.get(backup_type, ("bak", {"full": "full", "incr": "incr"}))
-    today = datetime.date.today()
-
-    # Build expected filenames for each day in the week up to yesterday
-    expected: list[tuple[str, str]] = []  # (date_str, suffix)
-
-    # Sunday = full backup (always required)
-    full_date = week_start_date
-    expected.append((full_date.strftime("%Y%m%d"), suffixes["full"]))
-
-    # For SQL Server, differentials are cumulative — only the full is required.
-    # For other types, each weekday increment is part of the chain.
-    if backup_type != "sqlserver":
-        for delta in range(1, 7):
-            day = week_start_date + datetime.timedelta(days=delta)
-            if day >= today:
-                break
-            expected.append((day.strftime("%Y%m%d"), suffixes["incr"]))
-
-    found: list[str] = []
-    missing: list[str] = []
     backup_path = Path(backup_dir)
-
-    for date_str, suffix in expected:
-        fname = f"{job_name}_{date_str}_{suffix}.{ext}"
-        fpath = backup_path / fname
-        if fpath.exists() and fpath.stat().st_size > 0:
-            found.append(str(fpath))
-        else:
-            missing.append(date_str)
+    found = sorted(
+        str(path)
+        for path in backup_path.glob(f"{job_name}_*_{suffixes['full']}.{ext}")
+        if path.is_file() and path.stat().st_size > 0
+    )
+    missing = [] if found else ["full"]
 
     return found, missing
 
 
 def audit_backup_chain(job_config: dict, backup_dir: str) -> dict:
     """
-    Audit whether this week's backup chain is intact for a given job.
+    Audit whether the rolling backup chain is intact for a given job.
 
     Returns ChainAuditResult:
     {
@@ -220,13 +195,9 @@ def audit_backup_chain(job_config: dict, backup_dir: str) -> dict:
     """
     job_name = job_config.get("name", "unknown")
     backup_type = job_config.get("type", "sqlserver")
+    history = job_config.get("history") or {}
 
-    # Compute this week's Sunday (start of backup chain)
-    today = datetime.date.today()
-    days_since_sunday = (today.weekday() + 1) % 7  # Monday=0 ... Sunday=6 → convert to Sun=0
-    week_start = today - datetime.timedelta(days=days_since_sunday)
-
-    found, missing = get_chain_files(job_name, backup_dir, week_start, backup_type)
+    found, missing = get_chain_files(job_name, backup_dir, backup_type)
 
     intact = len(missing) == 0
     last_valid = None
@@ -237,7 +208,12 @@ def audit_backup_chain(job_config: dict, backup_dir: str) -> dict:
         if len(parts) >= 2:
             last_valid = parts[1]  # YYYYMMDD portion
 
-    recommendation = "proceed_incremental" if intact else "force_full"
+    try:
+        increments_since_full = int(history.get("increments_since_full", 0))
+    except (ValueError, TypeError):
+        increments_since_full = 6
+    force_full = not intact or increments_since_full >= 6
+    recommendation = "force_full" if force_full else "proceed_incremental"
 
     result = {
         "intact": intact,
@@ -257,6 +233,8 @@ def fuse_check(audit_result: dict) -> str:
     Given a ChainAuditResult, return the backup mode recommendation.
     Returns "force_full" or "proceed_incremental".
     """
+    if audit_result.get("recommendation") == "force_full":
+        return "force_full"
     if not audit_result.get("intact", False):
         return "force_full"
     return "proceed_incremental"
@@ -268,12 +246,13 @@ def audit_backup_chain_remote(job_config: dict, connector, base_path: str) -> di
     Server-to-server SQL Server backups live on the storage host
     (e.g. E:\\Backups\\<job>\\<job>_YYYYMMDD_full.bak), not on the orchestrator.
     This lists the storage directory over the connector and applies the same
-    weekly full+diff continuity logic as audit_backup_chain.
+    rolling full+diff continuity logic as audit_backup_chain.
     Returns the same ChainAuditResult dict. On any remote error it returns a
     permissive intact=True result so a transient storage hiccup does NOT force
     a needless full (the scheduler's last_full age rule still applies).
     """
     job_name = job_config.get("name", "unknown")
+    history = job_config.get("history") or {}
     # storage layout: <base_path>\<job_name>\  (base_path like "E:\Backups")
     remote_dir = f"{str(base_path).rstrip(chr(92))}\\{job_name}"
     ps = (
@@ -293,17 +272,17 @@ def audit_backup_chain_remote(job_config: dict, connector, base_path: str) -> di
         return {"intact": True, "missing_files": [], "last_valid_date": None,
                 "recommendation": "proceed_incremental"}
 
-    # SQL Server differentials are CUMULATIVE (each diff = all changes since the
-    # weekly full), so the chain is intact as long as THIS WEEK'S FULL exists.
-    # Missing intermediate diffs do NOT break the chain.
-    today = datetime.date.today()
-    week_start = today - datetime.timedelta(days=(today.weekday() + 1) % 7)
-    full_date = week_start.strftime("%Y%m%d")
-    full_name = f"{job_name}_{full_date}_full.bak"
-    intact = full_name in present
+    full_names = sorted(name for name in present if name.startswith(f"{job_name}_") and name.endswith("_full.bak"))
+    intact = bool(full_names)
+    latest_full = full_names[-1].split("_")[-2] if full_names else None
+    try:
+        increments_since_full = int(history.get("increments_since_full", 0))
+    except (ValueError, TypeError):
+        increments_since_full = 6
+    force_full = not intact or increments_since_full >= 6
     return {
         "intact": intact,
-        "missing_files": [] if intact else [full_date],
-        "last_valid_date": full_date if intact else None,
-        "recommendation": "proceed_incremental" if intact else "force_full",
+        "missing_files": [] if intact else ["full"],
+        "last_valid_date": latest_full,
+        "recommendation": "force_full" if force_full else "proceed_incremental",
     }

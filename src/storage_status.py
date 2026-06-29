@@ -146,6 +146,7 @@ def build_status_from_storage(config: dict) -> dict:
                     "type": _db_type_for(fname),
                     "last_full": None,
                     "last_incremental": None,
+                    "increments_since_full": 0,
                     "chain_status": "unknown",
                     "last_result": "success",
                     "file_path": None,
@@ -153,6 +154,7 @@ def build_status_from_storage(config: dict) -> dict:
                     "md5_verified": False,
                     "duration_seconds": 0,
                     "_latest_mtime": "",
+                    "_incremental_dates": [],
                 },
             )
             is_full = kind == "full"
@@ -162,6 +164,8 @@ def build_status_from_storage(config: dict) -> dict:
             else:
                 if (j["last_incremental"] or "") < (date_iso or ""):
                     j["last_incremental"] = date_iso
+                if date_iso:
+                    j["_incremental_dates"].append(date_iso)
             # track the newest file overall for size/path/md5/result
             if mtime_s > j["_latest_mtime"]:
                 j["_latest_mtime"] = mtime_s
@@ -169,22 +173,19 @@ def build_status_from_storage(config: dict) -> dict:
                 j["file_size_mb"] = size_mb
                 j["md5_verified"] = has_md5 == "Y"
 
-        # 4) chain status: full present for THIS week?
-        today = datetime.date.today()
-        week_start = today - datetime.timedelta(days=(today.weekday() + 1) % 7)
-        week_start_iso = week_start.strftime("%Y%m%d")
+        # 4) chain status: a full exists; rolling increments are counted since latest full.
         for j in jobs.values():
             lf = j.get("last_full") or ""
-            # last_full ISO begins with YYYY-MM-DD; compare date portion to week_start
-            has_week_full = bool(lf) and lf[:10].replace("-", "") >= week_start_iso
-            j["chain_status"] = "intact" if has_week_full else "broken"
+            incremental_dates = j.pop("_incremental_dates", [])
+            j["increments_since_full"] = sum(1 for date in incremental_dates if lf and date > lf)
+            j["chain_status"] = "intact" if lf else "broken"
             j.pop("_latest_mtime", None)
             if j["chain_status"] == "broken":
                 status["alerts"].append(
                     {
                         "time": status["last_updated"],
                         "level": "warn",
-                        "message": f"[{j['name']}] 本周全量备份缺失，链状态: broken",
+                        "message": f"[{j['name']}] 全量备份缺失，链状态: broken",
                     }
                 )
 
