@@ -346,7 +346,7 @@ def _check_monthly_drill(config: dict[str, Any]) -> None:
 
 # ─── Main entry points ────────────────────────────────────────────────────────
 
-def run_once(config: dict[str, Any], job_filter: str | None = None) -> None:
+def run_once(config: dict[str, Any], job_filter: str | None = None, skip_verification: bool = False) -> None:
     """Run one backup cycle: all enabled jobs (or just job_filter) then exit."""
 
     status_path = str(config.get("status_file", "backup_status.json"))
@@ -373,7 +373,7 @@ def run_once(config: dict[str, Any], job_filter: str | None = None) -> None:
     _check_monthly_drill(config)
 
     # Monthly restore verification
-    if _restore_verifier.is_verification_day(config):
+    if not skip_verification and _restore_verifier.is_verification_day(config):
         logger.info("Monthly verification day — running restore verification")
         _restore_verifier.run_monthly_verification(config)
 
@@ -485,23 +485,22 @@ def main() -> int:
             dry_run(cfg, args.job)
             return 0
 
-        if args.verify_restore:
-            logger.info("--verify-restore: running restore verification now")
-            results = _restore_verifier.run_monthly_verification(cfg)
-            for r in results:
-                status_str = "OK" if r["success"] else "FAILED"
-                print(f"  [{status_str}] {r['db_name']:12s} tables={r['tables_count']} "
-                      f"duration={r['duration_seconds']:.1f}s "
-                      f"error={r.get('error_msg','')[:60] if not r['success'] else ''}")
-            return 0
-
         if args.refresh_status:
             ok = _storage_status.refresh_dashboard_status(cfg)
             print("[OK] Dashboard status refreshed from storage" if ok else "[ERROR] Dashboard status refresh failed")
             return 0 if ok else 1
 
-        if args.once:
-            run_once(cfg, args.job)
+        if args.once or args.verify_restore:
+            if args.once:
+                run_once(cfg, args.job, skip_verification=args.verify_restore)
+            if args.verify_restore:
+                logger.info("--verify-restore: forcing restore verification now")
+                results = _restore_verifier.run_monthly_verification(cfg, force=True)
+                for r in results:
+                    status_str = "OK" if r["success"] else "FAILED"
+                    print(f"  [{status_str}] {r['db_name']:12s} tables={r['tables_count']} "
+                          f"duration={r['duration_seconds']:.1f}s "
+                          f"error={r.get('error_msg','')[:60] if not r['success'] else ''}")
             return 0
 
         # Continuous loop

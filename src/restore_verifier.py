@@ -14,8 +14,8 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import shlex
 import time
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -47,48 +47,66 @@ def _make_result(
     }
 
 
-def _find_latest_backup(backup_dir: str, pattern: str) -> str | None:
-    """Find the most recent file in backup_dir matching pattern. Returns None if not found."""
+def _find_latest_full_on_storage(config: dict[str, Any], name_glob: str) -> dict[str, str] | None:
+    """Find the newest full backup on the storage server matching name_glob."""
+    connector: Any | None = None
     try:
-        candidates = sorted(
-            Path(backup_dir).glob(pattern),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
+        _ensure_src_on_path()
+        try:
+            import utils as _utils
+        except ImportError as exc:
+            logger.warning("_find_latest_full_on_storage import failed: %s", exc)
+            return None
+
+        connector = _utils.create_target_connector(config)
+        if connector is None:
+            return None
+
+        base_path = str(config.get("backup_target", {}).get("base_path", "E:\\Backups"))
+        base_literal = _ps_single_quote(base_path)
+        glob_literal = _ps_single_quote(name_glob)
+        ps = (
+            f"$base={base_literal}; if (Test-Path $base) {{ "
+            "Get-ChildItem -Path $base -Recurse -File | "
+            f"Where-Object {{ $_.Name -like {glob_literal} }} | "
+            "Sort-Object LastWriteTimeUtc -Descending | "
+            "Select-Object -First 1 | "
+            "ForEach-Object { Write-Output (\"{0}|{1}|{2}\" -f "
+            "$_.FullName, $_.Directory.Name, $_.Name) } }"
         )
-        return str(candidates[0]) if candidates else None
+        code, out, err = connector.exec_command(ps)
+        if code != 0:
+            logger.warning("_find_latest_full_on_storage failed: %s", (err or out)[:200])
+            return None
+
+        line = next((item.strip() for item in out.splitlines() if item.strip()), "")
+        if not line:
+            return None
+        parts = line.split("|", 2)
+        if len(parts) != 3 or not all(parts):
+            logger.warning("_find_latest_full_on_storage malformed output: %s", line[:200])
+            return None
+        remote_path, job, filename = parts
+        return {"remote_path": remote_path, "job": job, "filename": filename}
     except Exception as exc:
-        logger.warning("_find_latest_backup failed for %s: %s", backup_dir, exc)
+        logger.warning("_find_latest_full_on_storage failed: %s", exc)
         return None
+    finally:
+        if connector is not None:
+            try:
+                connector.close()
+            except Exception:
+                logger.debug("Ignoring storage connector close failure", exc_info=True)
 
 
-def _find_latest_mysql_backup(config: dict[str, Any]) -> str | None:
-    """Find the most recent MySQL full backup across all configured mysql jobs."""
-    try:
-        for job in config.get("databases", []):
-            if job.get("type") == "mysql" and job.get("enabled", False):
-                backup_dir = job.get("backup_dir", "")
-                if backup_dir:
-                    backup_file = _find_latest_backup(backup_dir, "*_full.sql.gz")
-                    if backup_file:
-                        return backup_file
-    except Exception as exc:
-        logger.warning("_find_latest_mysql_backup failed: %s", exc)
-    return None
+def _find_latest_mysql_backup(config: dict[str, Any]) -> dict[str, str] | None:
+    """Find the most recent MySQL full backup on the storage server."""
+    return _find_latest_full_on_storage(config, "*_full.sql.gz")
 
 
-def _find_latest_sqlserver_backup(config: dict[str, Any]) -> str | None:
-    """Find the most recent SQL Server full backup."""
-    try:
-        for job in config.get("databases", []):
-            if job.get("type") == "sqlserver" and job.get("enabled", False):
-                backup_dir = job.get("backup_dir", "")
-                if backup_dir:
-                    backup_file = _find_latest_backup(backup_dir, "*_full.bak")
-                    if backup_file:
-                        return backup_file
-    except Exception as exc:
-        logger.warning("_find_latest_sqlserver_backup failed: %s", exc)
-    return None
+def _find_latest_sqlserver_backup(config: dict[str, Any]) -> dict[str, str] | None:
+    """Find the most recent SQL Server full backup on the storage server."""
+    return _find_latest_full_on_storage(config, "*_full.bak")
 
 
 def _ensure_src_on_path() -> None:
@@ -107,12 +125,12 @@ def _sh_single_quote(value: str) -> str:
 
 def verify_mysql_restore(config: dict[str, Any]) -> RestoreResult:
     """
-    Restore the latest MySQL backup to the Linux test machine and verify.
+    Restore the latest MySQL backup from storage to the Linux test machine and verify.
 
     Steps:
-    1. Find latest MySQL full backup file on this (scheduling) machine
+    1. Find latest MySQL full backup file on the storage server
     2. SSH-connect to linux_machine test server
-    3. Upload the backup file
+    3. Pull the backup directly from storage with smbclient
     4. DROP and recreate test_db
     5. Restore with gunzip | mysql
     6. Query table count to verify
@@ -145,14 +163,32 @@ def verify_mysql_restore(config: dict[str, Any]) -> RestoreResult:
         test_db = str(lm.get("test_db", "restore_test_db"))
         mysql_user = str(lm.get("mysql_user", "root"))
         mysql_pass = str(lm.get("mysql_password", ""))
-        backup_file = _find_latest_mysql_backup(config)
+        backup = _find_latest_mysql_backup(config)
 
-        if not backup_file:
+        if not backup:
             return _make_result(
                 success=False,
                 db_name="mysql",
                 started_at=started_at,
-                error_msg="No MySQL full backup found locally",
+                error_msg="No MySQL full backup found on storage",
+            )
+
+        target = config.get("backup_target", {})
+        try:
+            base_path = str(target.get("base_path", "E:\\Backups"))
+            base_sub = base_path.split(":", 1)[1].lstrip("\\")
+            drive_letter = base_path.split(":", 1)[0]
+            admin_share = f"{drive_letter}$"
+            storage_ip = str(target["host"])
+            store_domain = str(target.get("domain", ""))
+            store_user = str(target.get("username", ""))
+            store_pw = str(target.get("password", ""))
+        except (KeyError, IndexError) as exc:
+            return _make_result(
+                success=False,
+                db_name="mysql",
+                started_at=started_at,
+                error_msg=f"backup_target storage config invalid: {exc}",
             )
 
         _ensure_src_on_path()
@@ -175,14 +211,34 @@ def verify_mysql_restore(config: dict[str, Any]) -> RestoreResult:
             retry_delay=10,
         )
 
-        remote_tmp = f"/tmp/restore_test_{os.path.basename(backup_file)}"
-        logger.info("verify_mysql_restore: uploading %s → %s", backup_file, remote_tmp)
-        if not conn.upload_file(backup_file, remote_tmp):
+        job = backup["job"]
+        filename = backup["filename"]
+        smb_user = f"{store_domain}\\{store_user}" if store_domain else store_user
+        remote_tmp = f"/tmp/restore_test_{filename}"
+        smb_script = f'prompt OFF; cd "{base_sub}\\{job}"; get "{filename}" {remote_tmp}'
+        smb_cmd = (
+            f"smbclient //{storage_ip}/{admin_share} -U {shlex.quote(smb_user + '%' + store_pw)} "
+            f"-c {shlex.quote(smb_script)} 2>&1; echo SMB_DONE"
+        )
+        logger.info("verify_mysql_restore: pulling %s → %s", backup["remote_path"], remote_tmp)
+        _code, smb_out, _err = conn.exec_command(smb_cmd)
+        if "NT_STATUS" in (smb_out or ""):
+            bad_lines = [line for line in smb_out.splitlines() if "NT_STATUS" in line and "COLLISION" not in line]
+            if bad_lines:
+                return _make_result(
+                    success=False,
+                    db_name="mysql",
+                    started_at=started_at,
+                    error_msg=f"smbclient pull failed: {bad_lines[0][:200]}",
+                )
+
+        exit_code, got_out, err = conn.exec_command(f"test -f {shlex.quote(remote_tmp)} && echo GOT")
+        if exit_code != 0 or "GOT" not in got_out:
             return _make_result(
                 success=False,
                 db_name="mysql",
                 started_at=started_at,
-                error_msg="Failed to upload backup file to test machine",
+                error_msg=f"Backup pull failed; file not found on test machine: {(smb_out or err)[:200]}",
             )
 
         mysql_auth = f"-u{_sh_single_quote(mysql_user)} -p{_sh_single_quote(mysql_pass)}"
@@ -263,15 +319,41 @@ def _ps_single_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _parse_sqlserver_filelist(output: str) -> list[tuple[str, str]]:
+    """Parse sqlcmd RESTORE FILELISTONLY rows into (logical_name, file_type)."""
+    files: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) >= 3 and parts[0] and parts[2] in {"D", "L"}:
+            files.append((parts[0], parts[2]))
+    return files
+
+
+def _first_sqlcmd_value(output: str) -> str:
+    """Return the first useful scalar value from sqlcmd output."""
+    for line in output.splitlines():
+        value = line.strip()
+        if not value or value.startswith("-") or value.startswith("("):
+            continue
+        return value
+    return ""
+
+
+def _safe_restore_file_stem(value: str) -> str:
+    """Make a SQL Server logical file name safe for a restore target filename."""
+    safe = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in value)
+    return safe.strip("_") or "file"
+
+
 def verify_sqlserver_restore(config: dict[str, Any]) -> RestoreResult:
     """
-    Restore the latest SQL Server backup to the Windows test machine and verify.
+    Restore the latest SQL Server backup from storage to the Windows test machine and verify.
 
     Steps:
-    1. Find latest SQL Server full backup (.bak)
+    1. Find latest SQL Server full backup (.bak) on the storage server
     2. Connect to windows_machine via WindowsConnector (WinRM/SSH)
-    3. Upload the .bak file to test machine
-    4. RESTORE DATABASE with REPLACE
+    3. Pull the .bak directly from storage over SMB
+    4. RESTORE DATABASE with REPLACE and MOVE when file metadata is available
     5. Query sys.tables count
     """
     started_at = time.time()
@@ -301,14 +383,32 @@ def verify_sqlserver_restore(config: dict[str, Any]) -> RestoreResult:
 
         test_db = str(wm.get("test_db", "restore_test_db"))
         sql_instance = str(wm.get("sqlserver_instance", "localhost"))
-        backup_file = _find_latest_sqlserver_backup(config)
+        backup = _find_latest_sqlserver_backup(config)
 
-        if not backup_file:
+        if not backup:
             return _make_result(
                 success=False,
                 db_name="sqlserver",
                 started_at=started_at,
-                error_msg="No SQL Server full backup found locally",
+                error_msg="No SQL Server full backup found on storage",
+            )
+
+        target = config.get("backup_target", {})
+        try:
+            base_path = str(target.get("base_path", "E:\\Backups"))
+            base_sub = base_path.split(":", 1)[1].lstrip("\\")
+            drive_letter = base_path.split(":", 1)[0]
+            admin_share = f"{drive_letter}$"
+            storage_ip = str(target["host"])
+            store_domain = str(target.get("domain", ""))
+            store_user = str(target.get("username", ""))
+            store_pw = str(target.get("password", ""))
+        except (KeyError, IndexError) as exc:
+            return _make_result(
+                success=False,
+                db_name="sqlserver",
+                started_at=started_at,
+                error_msg=f"backup_target storage config invalid: {exc}",
             )
 
         _ensure_src_on_path()
@@ -331,7 +431,11 @@ def verify_sqlserver_restore(config: dict[str, Any]) -> RestoreResult:
             ssh_port=int(wm.get("ssh_port", 22)),
         )
 
-        remote_bak = f"C:\\Temp\\restore_test_{os.path.basename(backup_file)}"
+        job = backup["job"]
+        filename = backup["filename"]
+        share_path = f"\\\\{storage_ip}\\{admin_share}"
+        unc_source = f"{share_path}\\{base_sub}\\{job}\\{filename}"
+        remote_bak = f"C:\\Temp\\restore_test_{filename}"
         code, _, err = conn.exec_command(
             "if (-not (Test-Path C:\\Temp)) { New-Item -ItemType Directory C:\\Temp | Out-Null }"
         )
@@ -343,19 +447,60 @@ def verify_sqlserver_restore(config: dict[str, Any]) -> RestoreResult:
                 error_msg=f"Failed to prepare remote temp directory: {err[:200]}",
             )
 
-        logger.info("verify_sqlserver_restore: uploading %s → %s", backup_file, remote_bak)
-        if not conn.upload_file(backup_file, remote_bak):
+        full_user = f"{store_domain}\\{store_user}" if store_domain else store_user
+        ps_copy = (
+            f"net use {share_path} {_ps_single_quote(store_pw)} /user:{full_user} | Out-Null; "
+            f"Copy-Item -Path {_ps_single_quote(unc_source)} -Destination {_ps_single_quote(remote_bak)} -Force; "
+            f"$ok = Test-Path {_ps_single_quote(remote_bak)}; "
+            f"net use {share_path} /delete /y | Out-Null; "
+            "if ($ok) { Write-Output 'COPY_OK' } else { Write-Output 'COPY_FAIL' }"
+        )
+        logger.info("verify_sqlserver_restore: pulling %s → %s", backup["remote_path"], remote_bak)
+        code, copy_out, err = conn.exec_command(ps_copy)
+        if code != 0 or "COPY_OK" not in copy_out:
             return _make_result(
                 success=False,
                 db_name="sqlserver",
                 started_at=started_at,
-                error_msg="Failed to upload .bak to test machine",
+                error_msg=f"SMB copy failed: {(err or copy_out)[:300]}",
+            )
+
+        filelist_sql = f"RESTORE FILELISTONLY FROM DISK=N{_sql_single_quote(remote_bak)}"
+        filelist_cmd = f"sqlcmd -S {_ps_single_quote(sql_instance)} -Q {_ps_single_quote(filelist_sql)} -h-1 -W -s \"|\""
+        _code, filelist_out, _err = conn.exec_command(filelist_cmd)
+        filelist = _parse_sqlserver_filelist(filelist_out)
+
+        default_dir_sql = "SET NOCOUNT ON; SELECT CONVERT(nvarchar(4000), SERVERPROPERTY('InstanceDefaultDataPath'))"
+        default_dir_cmd = f"sqlcmd -S {_ps_single_quote(sql_instance)} -Q {_ps_single_quote(default_dir_sql)} -h-1 -W"
+        _code, default_dir_out, _err = conn.exec_command(default_dir_cmd)
+        default_data_dir = _first_sqlcmd_value(default_dir_out)
+        if not default_data_dir or default_data_dir.upper() == "NULL":
+            default_data_dir = "C:\\Temp\\"
+        if not default_data_dir.endswith(("\\", "/")):
+            default_data_dir += "\\"
+
+        move_clauses: list[str] = []
+        data_index = 0
+        log_index = 0
+        for logical_name, file_type in filelist:
+            if file_type == "L":
+                log_index += 1
+                index = log_index
+                extension = "ldf"
+            else:
+                data_index += 1
+                index = data_index
+                extension = "mdf"
+            safe_logical = _safe_restore_file_stem(logical_name)
+            target_file = f"{default_data_dir}{test_db}_{safe_logical}_{index}.{extension}"
+            move_clauses.append(
+                f", MOVE N{_sql_single_quote(logical_name)} TO N{_sql_single_quote(target_file)}"
             )
 
         restore_sql = (
             f"RESTORE DATABASE [{test_db}] "
             f"FROM DISK=N{_sql_single_quote(remote_bak)} "
-            "WITH REPLACE, RECOVERY"
+            f"WITH REPLACE, RECOVERY{''.join(move_clauses)}"
         )
         restore_cmd = f"sqlcmd -S {_ps_single_quote(sql_instance)} -Q {_ps_single_quote(restore_sql)}"
         exit_code, _, err = conn.exec_command(restore_cmd)
@@ -428,16 +573,17 @@ def is_verification_day(config: dict[str, Any]) -> bool:
         return False
 
 
-def run_monthly_verification(config: dict[str, Any]) -> list[RestoreResult]:
+def run_monthly_verification(config: dict[str, Any], force: bool = False) -> list[RestoreResult]:
     """
     Run both MySQL and SQL Server restore verifications on the scheduled day.
 
-    Returns list of RestoreResult dicts. When restore testing is disabled or today is
-    not config['restore_test']['schedule_day'], returns an empty list.
+    Returns list of RestoreResult dicts. When force is False and restore testing is
+    disabled or today is not config['restore_test']['schedule_day'], returns an empty list.
+    When force is True, skips the schedule-day gate and runs immediately.
     Sends alerts via alerter for each result.
     """
     try:
-        if not is_verification_day(config):
+        if not force and not is_verification_day(config):
             logger.info("run_monthly_verification: skipped; not scheduled verification day")
             return []
 
